@@ -184,9 +184,101 @@ async fn run_sync_stream(
     Ok(Sse::new(stream::iter(events.into_iter().map(Ok))).keep_alive(KeepAlive::default()))
 }
 
+fn map_sync_execution(
+    id: i64,
+    sync_task_id: i64,
+    status: String,
+    message: Option<String>,
+    run_log: String,
+    started_at: String,
+    finished_at: Option<String>,
+) -> Value {
+    json!({
+        "id": id,
+        "sync_task_id": sync_task_id,
+        "status": status,
+        "message": message,
+        "run_log": run_log,
+        "started_at": started_at,
+        "finished_at": finished_at
+    })
+}
+
+async fn list_executions(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(sync_task_id): Path<i64>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "sync:read")?;
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            i64,
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+        ),
+    >(
+        r#"
+        SELECT id, sync_task_id, status, message, run_log, started_at, finished_at
+        FROM sync_executions
+        WHERE sync_task_id = ?
+        ORDER BY id DESC
+        LIMIT 50
+        "#,
+    )
+    .bind(sync_task_id)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(json!(rows
+        .into_iter()
+        .map(|r| map_sync_execution(r.0, r.1, r.2, r.3, r.4, r.5, r.6))
+        .collect::<Vec<_>>())))
+}
+
+async fn latest_execution(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(sync_task_id): Path<i64>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "sync:read")?;
+    let row = sqlx::query_as::<
+        _,
+        (
+            i64,
+            i64,
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+        ),
+    >(
+        r#"
+        SELECT id, sync_task_id, status, message, run_log, started_at, finished_at
+        FROM sync_executions
+        WHERE sync_task_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(sync_task_id)
+    .fetch_optional(&state.db)
+    .await?;
+    Ok(Json(match row {
+        Some(r) => map_sync_execution(r.0, r.1, r.2, r.3, r.4, r.5, r.6),
+        None => Value::Null,
+    }))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_sync_tasks).post(create_sync_task))
         .route("/{sync_task_id}/run", post(run_sync))
         .route("/{sync_task_id}/run/stream", post(run_sync_stream))
+        .route("/{sync_task_id}/executions", get(list_executions))
+        .route("/{sync_task_id}/executions/latest", get(latest_execution))
 }

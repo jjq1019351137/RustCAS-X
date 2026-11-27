@@ -32,12 +32,15 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
             Option<i64>,
             Option<String>,
             String,
+            Option<String>,
+            Option<String>,
+            i64,
         ),
     >(
         r#"
         SELECT taskname, shareurl, savepath, account_name, tmdb_media_type,
                pattern, "replace", startfid, tmdb_id, ignore_extension,
-               update_subdir, extra_json
+               update_subdir, extra_json, enddate, shareurl_ban, enabled
         FROM tasks WHERE id = ?
         "#,
     )
@@ -59,6 +62,9 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
         ignore_extension,
         update_subdir,
         extra_json,
+        enddate,
+        shareurl_ban,
+        enabled,
     ) = row;
     let pattern = pattern.unwrap_or_default();
     let replace = replace.unwrap_or_default();
@@ -107,6 +113,32 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
 
     let mut log = String::new();
     log.push_str(&format!("[{}] start task={taskname}\n", Utc::now().to_rfc3339()));
+
+    if enabled == 0 {
+        return finish(state, exec_id, "skipped", "task disabled", &mut log).await;
+    }
+    if extra.get("ended").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return finish(state, exec_id, "skipped", "task marked ended", &mut log).await;
+    }
+    if let Some(ban) = shareurl_ban.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        log.push_str(&format!("shareurl_ban={ban}\n"));
+        return finish(state, exec_id, "skipped", "shareurl banned", &mut log).await;
+    }
+    if let Some(ed) = enddate.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Ok(end_d) = chrono::NaiveDate::parse_from_str(&ed[..ed.len().min(10)], "%Y-%m-%d") {
+            let today = chrono::Local::now().date_naive();
+            if today > end_d {
+                return finish(
+                    state,
+                    exec_id,
+                    "skipped",
+                    &format!("past enddate {ed}"),
+                    &mut log,
+                )
+                .await;
+            }
+        }
+    }
 
     let tmdb_cfg = tmdb::load_config(state).await.unwrap_or_default();
     let mut series_title: Option<String> = None;

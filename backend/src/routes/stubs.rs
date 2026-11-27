@@ -34,6 +34,5 @@ pub fn router() -> Router<AppState> {
         .route("/plugins", get(plugins_list))
         .route("/audit-logs", get(empty_list))
         .route("/notifications", get(notifications))
-        .route("/magic-regex", get(empty_object))
         .route("/metrics", get(metrics))
 }

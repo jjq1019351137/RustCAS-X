@@ -27,6 +27,8 @@ pub struct TaskCreateIn {
     replace_rule: Option<String>,
     startfid: Option<String>,
     update_subdir: Option<String>,
+    enddate: Option<String>,
+    shareurl_ban: Option<String>,
     tmdb_id: Option<i64>,
     tmdb_media_type: Option<String>,
     #[serde(default)]
@@ -50,6 +52,8 @@ pub struct TaskUpdateIn {
     replace_rule: Option<String>,
     startfid: Option<String>,
     update_subdir: Option<String>,
+    enddate: Option<String>,
+    shareurl_ban: Option<String>,
     tmdb_id: Option<i64>,
     tmdb_media_type: Option<String>,
     ignore_extension: Option<bool>,
@@ -82,6 +86,8 @@ struct TaskRow {
     replace_rule: Option<String>,
     startfid: Option<String>,
     update_subdir: Option<String>,
+    enddate: Option<String>,
+    shareurl_ban: Option<String>,
     ignore_extension: Option<i64>,
     addition_json: String,
     extra_json: String,
@@ -105,6 +111,8 @@ fn map_task_full(r: TaskRow) -> Value {
         &extra,
         &episode_weekdays,
         &update_weekdays,
+        r.enddate.as_deref(),
+        r.shareurl_ban.as_deref(),
     );
     json!({
         "id": r.id,
@@ -118,6 +126,8 @@ fn map_task_full(r: TaskRow) -> Value {
         "replace": r.replace_rule.unwrap_or_default(),
         "startfid": r.startfid.unwrap_or_default(),
         "update_subdir": r.update_subdir.unwrap_or_default(),
+        "enddate": r.enddate.clone(),
+        "shareurl_ban": r.shareurl_ban.clone(),
         "ignore_extension": r.ignore_extension.unwrap_or(0) != 0,
         "enabled": r.enabled != 0,
         "tmdb_id": r.tmdb_id,
@@ -137,7 +147,8 @@ fn map_task_full(r: TaskRow) -> Value {
 const TASK_SELECT: &str = r#"
 SELECT id, task_uid, task_type, taskname, shareurl, savepath, enabled,
        tmdb_id, tmdb_media_type, account_name, pattern, "replace", startfid,
-       update_subdir, ignore_extension, addition_json, extra_json, created_at, updated_at
+       update_subdir, enddate, shareurl_ban, ignore_extension,
+       addition_json, extra_json, created_at, updated_at
 FROM tasks
 "#;
 
@@ -173,12 +184,24 @@ fn compute_would_run_today(
     extra: &Value,
     episode_weekdays: &[i64],
     update_weekdays: &[i64],
+    enddate: Option<&str>,
+    shareurl_ban: Option<&str>,
 ) -> bool {
     if !enabled {
         return false;
     }
     if extra.get("ended").and_then(|v| v.as_bool()).unwrap_or(false) {
         return false;
+    }
+    if shareurl_ban.map(|s| !s.trim().is_empty()).unwrap_or(false) {
+        return false;
+    }
+    if let Some(ed) = enddate.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Ok(end_d) = chrono::NaiveDate::parse_from_str(&ed[..ed.len().min(10)], "%Y-%m-%d") {
+            if chrono::Local::now().date_naive() > end_d {
+                return false;
+            }
+        }
     }
     let today = chrono::Local::now().date_naive().weekday().number_from_monday() as i64;
     let mode = extra
@@ -245,9 +268,10 @@ async fn create_task(
         r#"
         INSERT INTO tasks
             (task_uid, task_type, taskname, shareurl, savepath, account_name,
-             pattern, "replace", startfid, update_subdir, tmdb_id, tmdb_media_type,
-             ignore_extension, enabled, addition_json, extra_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             pattern, "replace", startfid, update_subdir, enddate, shareurl_ban,
+             tmdb_id, tmdb_media_type, ignore_extension, enabled,
+             addition_json, extra_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING id
         "#,
     )
@@ -261,6 +285,8 @@ async fn create_task(
     .bind(payload.replace_rule.as_deref().unwrap_or(""))
     .bind(payload.startfid.as_deref().unwrap_or(""))
     .bind(payload.update_subdir.as_deref().unwrap_or(""))
+    .bind(&payload.enddate)
+    .bind(&payload.shareurl_ban)
     .bind(payload.tmdb_id)
     .bind(&payload.tmdb_media_type)
     .bind(if payload.ignore_extension { 1 } else { 0 })
@@ -313,6 +339,12 @@ async fn patch_task(
     let update_subdir = payload
         .update_subdir
         .unwrap_or_else(|| mapped["update_subdir"].as_str().unwrap_or("").to_string());
+    let enddate = payload
+        .enddate
+        .or_else(|| mapped["enddate"].as_str().map(|s| s.to_string()));
+    let shareurl_ban = payload
+        .shareurl_ban
+        .or_else(|| mapped["shareurl_ban"].as_str().map(|s| s.to_string()));
     let tmdb_id = payload
         .tmdb_id
         .or_else(|| mapped["tmdb_id"].as_i64());
@@ -336,6 +368,7 @@ async fn patch_task(
         UPDATE tasks SET
             taskname=?, shareurl=?, savepath=?, account_name=?,
             pattern=?, "replace"=?, startfid=?, update_subdir=?,
+            enddate=?, shareurl_ban=?,
             tmdb_id=?, tmdb_media_type=?, ignore_extension=?, enabled=?,
             addition_json=?, extra_json=?, updated_at=?
         WHERE id=?
@@ -349,6 +382,8 @@ async fn patch_task(
     .bind(&replace_rule)
     .bind(&startfid)
     .bind(&update_subdir)
+    .bind(&enddate)
+    .bind(&shareurl_ban)
     .bind(tmdb_id)
     .bind(&tmdb_media_type)
     .bind(if ignore_extension { 1 } else { 0 })
@@ -421,6 +456,135 @@ async fn run_task_stream(
     Ok(Sse::new(stream::iter(events.into_iter().map(Ok))).keep_alive(KeepAlive::default()))
 }
 
+fn map_execution(
+    id: i64,
+    task_id: i64,
+    status: String,
+    stage: Option<String>,
+    message: Option<String>,
+    run_log: String,
+    started_at: String,
+    finished_at: Option<String>,
+) -> Value {
+    json!({
+        "id": id,
+        "task_id": task_id,
+        "status": status,
+        "stage": stage,
+        "message": message,
+        "run_log": run_log,
+        "started_at": started_at,
+        "finished_at": finished_at
+    })
+}
+
+async fn list_executions(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(task_id): Path<i64>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:read")?;
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+        ),
+    >(
+        r#"
+        SELECT id, task_id, status, stage, message, run_log, started_at, finished_at
+        FROM task_executions
+        WHERE task_id = ?
+        ORDER BY id DESC
+        LIMIT 50
+        "#,
+    )
+    .bind(task_id)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(json!(rows
+        .into_iter()
+        .map(|r| map_execution(r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7))
+        .collect::<Vec<_>>())))
+}
+
+async fn get_execution(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((task_id, exec_id)): Path<(i64, i64)>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:read")?;
+    let row = sqlx::query_as::<
+        _,
+        (
+            i64,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+        ),
+    >(
+        r#"
+        SELECT id, task_id, status, stage, message, run_log, started_at, finished_at
+        FROM task_executions
+        WHERE task_id = ? AND id = ?
+        "#,
+    )
+    .bind(task_id)
+    .bind(exec_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::bad_request("EXEC_NOT_FOUND", "执行记录不存在"))?;
+    Ok(Json(map_execution(
+        row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7,
+    )))
+}
+
+async fn latest_execution(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(task_id): Path<i64>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:read")?;
+    let row = sqlx::query_as::<
+        _,
+        (
+            i64,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+        ),
+    >(
+        r#"
+        SELECT id, task_id, status, stage, message, run_log, started_at, finished_at
+        FROM task_executions
+        WHERE task_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(task_id)
+    .fetch_optional(&state.db)
+    .await?;
+    Ok(Json(match row {
+        Some(r) => map_execution(r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7),
+        None => Value::Null,
+    }))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_tasks).post(create_task))
@@ -430,4 +594,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/{task_id}/run", post(run_task))
         .route("/{task_id}/run/stream", post(run_task_stream))
+        .route("/{task_id}/executions", get(list_executions))
+        .route("/{task_id}/executions/latest", get(latest_execution))
+        .route("/{task_id}/executions/{exec_id}", get(get_execution))
 }

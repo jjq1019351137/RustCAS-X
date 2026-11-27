@@ -69,6 +69,16 @@ fn account_out(
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_else(|| json!({}));
+    let used = profile
+        .get("used_space")
+        .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)));
+    let total = profile
+        .get("total_space")
+        .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)));
+    let usage_ratio = match (used, total) {
+        (Some(u), Some(t)) if t > 0 => Some((u as f64) / (t as f64)),
+        _ => None,
+    };
     json!({
         "id": id,
         "name": name,
@@ -78,14 +88,19 @@ fn account_out(
         "enabled": enabled != 0,
         "is_default": is_default != 0,
         "capacity_warning_threshold": capacity_warning_threshold,
-        "used_space": null,
-        "total_space": null,
-        "usage_ratio": null,
+        "used_space": used,
+        "total_space": total,
+        "usage_ratio": usage_ratio,
+        "capacity_warning": usage_ratio
+            .map(|r| r * 100.0 >= capacity_warning_threshold as f64)
+            .unwrap_or(false),
         "runtime_status": runtime_status,
         "probe_fail_count": probe_fail_count,
         "last_checked_at": last_checked_at,
-        "profile_updated_at": null,
+        "profile_updated_at": last_checked_at,
         "last_error": last_error,
+        "nickname": profile.get("nickname"),
+        "member_type": profile.get("member_type"),
         "has_302_path": false,
         "lsdir_cache_base_path": null,
         "lsdir_cache_file_total": 0,
@@ -163,8 +178,9 @@ async fn create_account(
 ) -> AppResult<Json<Value>> {
     require_perm(&user, "drive_account:write")?;
     let drive_type = payload.drive_type.trim().to_string();
-    if !matches!(drive_type.as_str(), "quark" | "cloud189") {
-        return Err(AppError::bad_request("DRIVE_TYPE", "仅支持 quark / cloud189"));
+    // Focus: Quark only for this migration wave (cloud189 retained but not promoted).
+    if drive_type != "quark" && drive_type != "cloud189" {
+        return Err(AppError::bad_request("DRIVE_TYPE", "仅支持 quark（推荐）/ cloud189（未继续迁移）"));
     }
     let config = payload.config.unwrap_or_else(|| json!({}));
     let cookie = if let Some(c) = payload.cookie.filter(|s| !s.trim().is_empty()) {

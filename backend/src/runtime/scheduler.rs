@@ -133,9 +133,20 @@ async fn run_tick(state: &AppState) -> anyhow::Result<()> {
 }
 
 async fn due_drama_ids(state: &AppState, today_iso: i64) -> anyhow::Result<Vec<i64>> {
-    let rows = sqlx::query_as::<_, (i64, Option<i64>, Option<String>, String, String)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            Option<i64>,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
         r#"
-        SELECT id, tmdb_id, tmdb_media_type, addition_json, extra_json
+        SELECT id, tmdb_id, tmdb_media_type, addition_json, extra_json, enddate, shareurl_ban
         FROM tasks
         WHERE enabled = 1 AND task_type = 'drama'
         ORDER BY sort_index ASC, id ASC
@@ -146,7 +157,24 @@ async fn due_drama_ids(state: &AppState, today_iso: i64) -> anyhow::Result<Vec<i
     .await?;
 
     let mut out = Vec::new();
-    for (id, tmdb_id, media, addition_json, extra_json) in rows {
+    let today_date = (Utc::now() + chrono::Duration::hours(8)).date_naive();
+    for (id, tmdb_id, media, addition_json, extra_json, enddate, shareurl_ban) in rows {
+        if shareurl_ban
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if let Some(ed) = enddate.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if let Ok(end_d) =
+                chrono::NaiveDate::parse_from_str(&ed[..ed.len().min(10)], "%Y-%m-%d")
+            {
+                if today_date > end_d {
+                    continue;
+                }
+            }
+        }
         let addition: Value = serde_json::from_str(&addition_json).unwrap_or(json!({}));
         let extra: Value = serde_json::from_str(&extra_json).unwrap_or(json!({}));
         if would_run_today(tmdb_id, media.as_deref(), &addition, &extra, today_iso) {
