@@ -10,7 +10,8 @@ struct NotificationSetting {
     config: Value,
 }
 
-fn channel_enabled(cfg: &Value, key: &str) -> bool {
+/// Dual-format: nested `channels.<key>.enabled` or CAS flat `__channel_enabled.<key>`.
+pub fn channel_enabled(cfg: &Value, key: &str) -> bool {
     cfg.pointer(&format!("/channels/{key}/enabled"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
@@ -19,6 +20,13 @@ fn channel_enabled(cfg: &Value, key: &str) -> bool {
             .and_then(|v| v.get(key))
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
+}
+
+pub fn cfg_str<'a>(cfg: &'a Value, nested: &str, flat: &str) -> &'a str {
+    cfg.pointer(nested)
+        .and_then(|v| v.as_str())
+        .or_else(|| cfg.get(flat).and_then(|v| v.as_str()))
+        .unwrap_or("")
 }
 
 /// Send webhook with optional method / headers / bearer from channel config.

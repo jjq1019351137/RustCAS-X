@@ -48,8 +48,13 @@ const plugins = computed(() =>
   (pluginsData.value || []).filter((p) => p.enabled && p.task_config_fields && p.task_config_fields.length > 0),
 )
 
+function isAccountOnline(status: unknown): boolean {
+  const st = String(status || '').trim().toLowerCase()
+  return st === 'active' || st === 'ok'
+}
+
 const activeAccounts = computed(() =>
-  (accountsData.value || []).filter((a) => a.enabled && a.runtime_status === 'active'),
+  (accountsData.value || []).filter((a) => a.enabled && isAccountOnline(a.runtime_status)),
 )
 const syncTasks = computed(() => syncTasksData.value || [])
 
@@ -1550,7 +1555,7 @@ const resourceSearchDriveTypes = computed(() => {
   for (const a of accountsData.value || []) {
     if (a.enabled === false) continue
     const status = String((a as any).runtime_status || '').trim()
-    if (status && status !== 'active') continue
+    if (status && !isAccountOnline(status)) continue
     const dt = String(a.drive_type || '').trim()
     if (dt && !out.includes(dt)) out.push(dt)
   }

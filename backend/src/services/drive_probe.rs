@@ -80,7 +80,8 @@ pub async fn probe_account(state: &AppState, account_id: i64) -> anyhow::Result<
         WHERE id=?
         "#,
     )
-    .bind(if ok { "ok" } else { "error" })
+    // Frontend / CAS filters expect "active" (not "ok").
+    .bind(if ok { "active" } else { "error" })
     .bind(&now)
     .bind(init.get("message").and_then(|v| v.as_str()))
     .bind(profile)
@@ -90,6 +91,17 @@ pub async fn probe_account(state: &AppState, account_id: i64) -> anyhow::Result<
     .execute(&state.db)
     .await?;
     Ok(ok)
+}
+
+/// One-shot migration: older probes wrote runtime_status="ok".
+pub async fn normalize_legacy_runtime_status(db: &sqlx::SqlitePool) -> anyhow::Result<u64> {
+    let n = sqlx::query(
+        "UPDATE drive_accounts SET runtime_status='active' WHERE lower(runtime_status)='ok'",
+    )
+    .execute(db)
+    .await?
+    .rows_affected();
+    Ok(n)
 }
 
 pub async fn run_due_probes(state: &AppState) -> anyhow::Result<usize> {

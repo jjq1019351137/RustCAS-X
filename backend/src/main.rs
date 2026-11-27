@@ -39,6 +39,11 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = connect(&settings.database_url).await?;
     ensure_permissions_and_roles(&pool).await?;
+    match services::drive_probe::normalize_legacy_runtime_status(&pool).await {
+        Ok(n) if n > 0 => tracing::info!(updated = n, "normalized drive runtime_status ok→active"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "normalize drive runtime_status failed"),
+    }
 
     let state = AppState {
         db: pool,

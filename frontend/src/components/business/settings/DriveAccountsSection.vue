@@ -167,11 +167,11 @@ const summary = computed(() => ({
   warning_count: accountList.value.filter((i) => isWarning(i)).length,
 }))
 
-// --- status display (FIX: backend uses 'active', not 'ok') ---
+// --- status display (active preferred; accept legacy "ok") ---
 function getStatusMeta(account: DriveAccountItem): { dot: string; label: string; text: string } {
   if (!account.enabled) return { dot: 'bg-gray-400', label: '已禁用', text: 'text-[hsl(var(--muted-foreground))]' }
   const st = String(account.runtime_status || '').trim().toLowerCase()
-  if (st === 'active') return { dot: 'bg-green-500', label: '在线', text: 'text-green-600 dark:text-green-400' }
+  if (st === 'active' || st === 'ok') return { dot: 'bg-green-500', label: '在线', text: 'text-green-600 dark:text-green-400' }
   if (st === 'error') return { dot: 'bg-red-500', label: '异常', text: 'text-red-500' }
   if (st === 'inactive') return { dot: 'bg-amber-500', label: '离线', text: 'text-amber-600 dark:text-amber-400' }
   return { dot: 'bg-gray-400', label: '未探测', text: 'text-[hsl(var(--muted-foreground))]' }
