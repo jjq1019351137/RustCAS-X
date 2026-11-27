@@ -9,7 +9,7 @@ use crate::services::share_preview::{
     SharePreviewIn,
 };
 use crate::state::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -1128,14 +1128,70 @@ async fn stop_completed_drama_tasks(
     })))
 }
 
-async fn suggestions_stub(user: CurrentUser) -> AppResult<Json<Value>> {
-    require_perm(&user, "task:read")?;
-    Ok(Json(json!({ "items": [], "note": "resource search not ported" })))
+#[derive(Deserialize, Default)]
+struct SuggestionsQuery {
+    q: Option<String>,
+    d: Option<i64>,
+    drive_type: Option<String>,
+    drive_types: Option<String>,
+    sources: Option<String>,
 }
 
-async fn suggestions_verify_stub(user: CurrentUser) -> AppResult<Json<Value>> {
+#[derive(Deserialize, Default)]
+struct SuggestionsVerifyIn {
+    shareurls: Option<Vec<String>>,
+    account_name: Option<String>,
+}
+
+async fn task_suggestions(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Query(q): Query<SuggestionsQuery>,
+) -> AppResult<Json<Value>> {
     require_perm(&user, "task:read")?;
-    Ok(Json(json!({ "items": [], "note": "resource search verify not ported" })))
+    let keyword = q.q.unwrap_or_default();
+    let deep = q.d.unwrap_or(0);
+    let drive_type = q
+        .drive_type
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            q.drive_types
+                .as_deref()
+                .and_then(|s| s.split(',').map(|x| x.trim()).find(|x| !x.is_empty()))
+                .map(|s| s.to_string())
+        });
+    let sources: Option<Vec<String>> = q.sources.map(|s| {
+        s.split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect()
+    });
+    let out = crate::services::resource_search::fetch_suggestions(
+        &state.db,
+        &keyword,
+        deep,
+        drive_type.as_deref(),
+        sources.as_deref(),
+    )
+    .await
+    .map_err(|e| AppError::bad_request("SUGGESTIONS", e.to_string()))?;
+    Ok(Json(out))
+}
+
+async fn task_suggestions_verify(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(payload): Json<SuggestionsVerifyIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:read")?;
+    let out = crate::services::resource_search::verify_suggestions(
+        &state.db,
+        payload.shareurls.unwrap_or_default(),
+        payload.account_name,
+    )
+    .await
+    .map_err(|e| AppError::bad_request("SUGGESTIONS_VERIFY", e.to_string()))?;
+    Ok(Json(out))
 }
 
 async fn post_share_preview(
@@ -1318,8 +1374,8 @@ pub fn router() -> Router<AppState> {
         .route("/repair-banned", post(repair_banned_tasks))
         .route("/drama/stop-completed", post(stop_completed_drama_tasks))
         .route("/drama/savepath-snapshots/sync", post(savepath_snapshots_sync_stub))
-        .route("/suggestions", get(suggestions_stub))
-        .route("/suggestions/verify", post(suggestions_verify_stub))
+        .route("/suggestions", get(task_suggestions))
+        .route("/suggestions/verify", post(task_suggestions_verify))
         .route("/share/preview", post(post_share_preview))
         .route("/share/preview-batch", post(post_share_preview_batch))
         .route("/drive/browse", post(post_drive_browse))

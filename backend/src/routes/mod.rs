@@ -5,6 +5,7 @@ mod health;
 mod magic_regex;
 mod notifications;
 mod openlist;
+mod resource_search;
 mod roles;
 mod setup;
 mod stubs;
@@ -35,6 +36,7 @@ pub fn api_router(state: AppState) -> Router {
         .nest("/magic-regex", magic_regex::router())
         .nest("/openlist", openlist::router())
         .nest("/notifications", notifications::router())
+        .nest("/resource-search", resource_search::router())
         .merge(stubs::router())
         .with_state(state)
 }

@@ -519,12 +519,62 @@ async fn execution_files(
     if exists.is_none() {
         return Err(AppError::bad_request("EXEC_NOT_FOUND", "执行记录不存在"));
     }
-    // File-level ledger not ported yet; keep page shape for UI.
     let offset = q.offset.unwrap_or(0).max(0);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(1) FROM sync_execution_files WHERE sync_execution_id=?",
+    )
+    .bind(execution_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(0);
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            i64,
+            String,
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+            String,
+            String,
+        ),
+    >(
+        r#"
+        SELECT id, sync_execution_id, path, action, status, size, message, created_at, updated_at
+        FROM sync_execution_files
+        WHERE sync_execution_id = ?
+        ORDER BY id ASC
+        LIMIT ? OFFSET ?
+        "#,
+    )
+    .bind(execution_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.0,
+                "sync_execution_id": r.1,
+                "path": r.2,
+                "action": r.3,
+                "status": r.4,
+                "size": r.5,
+                "message": r.6,
+                "created_at": r.7,
+                "updated_at": r.8
+            })
+        })
+        .collect();
     Ok(Json(json!({
-        "items": [],
-        "total": 0,
+        "items": items,
+        "total": total,
         "offset": offset,
         "limit": limit
     })))

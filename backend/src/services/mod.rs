@@ -4,6 +4,7 @@ pub mod episode;
 pub mod magic_rename;
 pub mod openlist;
 pub mod rename;
+pub mod resource_search;
 pub mod share_links;
 pub mod share_preview;
 pub mod tmdb;
