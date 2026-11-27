@@ -452,6 +452,111 @@ impl CloudDriveAdapter for QuarkAdapter {
         self.get_detail_inner(pwd_id, stoken, pdir_fid).await
     }
 
+    async fn mkdir(&self, dir_path: &str) -> anyhow::Result<Value> {
+        let url = format!("{BASE_URL}/1/clouddrive/file");
+        let params = vec![
+            ("pr".into(), "ucpro".into()),
+            ("fr".into(), "pc".into()),
+            ("uc_param_str".into(), "".into()),
+        ];
+        let payload = json!({
+            "pdir_fid": "0",
+            "file_name": "",
+            "dir_path": dir_path,
+            "dir_init_lock": false
+        });
+        self.send_json(reqwest::Method::POST, url, params, Some(payload))
+            .await
+    }
+
+    async fn get_fids(&self, file_paths: &[String]) -> anyhow::Result<Vec<Value>> {
+        let mut fids = Vec::new();
+        let mut remaining: Vec<String> = file_paths.to_vec();
+        while !remaining.is_empty() {
+            let chunk: Vec<String> = remaining.drain(..remaining.len().min(50)).collect();
+            let url = format!("{BASE_URL}/1/clouddrive/file/info/path_list");
+            let params = vec![("pr".into(), "ucpro".into()), ("fr".into(), "pc".into())];
+            let payload = json!({ "file_path": chunk, "namespace": "0" });
+            let response = self
+                .send_json(reqwest::Method::POST, url, params, Some(payload))
+                .await?;
+            if response.get("code").and_then(|v| v.as_i64()) != Some(0) {
+                break;
+            }
+            if let Some(arr) = response.get("data").and_then(|v| v.as_array()) {
+                fids.extend(arr.clone());
+            }
+        }
+        Ok(fids)
+    }
+
+    async fn save_file(
+        &self,
+        fid_list: &[String],
+        fid_token_list: &[String],
+        to_pdir_fid: &str,
+        pwd_id: &str,
+        stoken: &str,
+    ) -> anyhow::Result<Value> {
+        let url = format!("{BASE_URL}/1/clouddrive/share/sharepage/save");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let params = vec![
+            ("pr".into(), "ucpro".into()),
+            ("fr".into(), "pc".into()),
+            ("uc_param_str".into(), "".into()),
+            ("app".into(), "clouddrive".into()),
+            ("__dt".into(), ((now_ms % 300_000) + 60_000).to_string()),
+            ("__t".into(), (now_ms / 1000).to_string()),
+        ];
+        let payload = json!({
+            "fid_list": fid_list,
+            "fid_token_list": fid_token_list,
+            "to_pdir_fid": to_pdir_fid,
+            "pwd_id": pwd_id,
+            "stoken": stoken,
+            "pdir_fid": "0",
+            "scene": "link"
+        });
+        self.send_json(reqwest::Method::POST, url, params, Some(payload))
+            .await
+    }
+
+    async fn query_task(&self, task_id: &str) -> anyhow::Result<Value> {
+        let mut retry_index = 0i64;
+        loop {
+            let url = format!("{BASE_URL}/1/clouddrive/task");
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let params = vec![
+                ("pr".into(), "ucpro".into()),
+                ("fr".into(), "pc".into()),
+                ("uc_param_str".into(), "".into()),
+                ("task_id".into(), task_id.into()),
+                ("retry_index".into(), retry_index.to_string()),
+                ("__dt".into(), ((now_ms % 300_000) + 60_000).to_string()),
+                ("__t".into(), (now_ms / 1000).to_string()),
+            ];
+            let response = self
+                .send_json(reqwest::Method::GET, url, params, None)
+                .await?;
+            let status = response.get("status").and_then(|v| v.as_i64()).unwrap_or(0);
+            if status != 200 {
+                return Ok(response);
+            }
+            let data_status = response
+                .pointer("/data/status")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1);
+            if data_status == 2 {
+                return Ok(response);
+            }
+            retry_index += 1;
+            if retry_index > 120 {
+                return Ok(response);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
     fn config(&self) -> &HashMap<String, Value> {
         &self.config
     }

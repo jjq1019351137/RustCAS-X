@@ -466,6 +466,205 @@ impl CloudDriveAdapter for Cloud189Adapter {
         Ok(json!({ "code": 0, "message": "success", "data": { "list": merged } }))
     }
 
+    async fn mkdir(&self, dir_path: &str) -> anyhow::Result<Value> {
+        if dir_path.trim().is_empty() || dir_path.trim() == "/" {
+            return Ok(json!({ "code": 0, "message": "success", "data": { "fid": "-11" } }));
+        }
+        let p = {
+            let mut s = format!("/{}", dir_path.trim().trim_start_matches('/'));
+            while s.contains("//") {
+                s = s.replace("//", "/");
+            }
+            s
+        };
+        let parts: Vec<&str> = p.split('/').filter(|x| !x.is_empty()).collect();
+        let mut parent_id = "-11".to_string();
+        for name in parts {
+            // try find existing
+            let list = self.ls_dir(&parent_id, 0).await?;
+            let found = list
+                .pointer("/data/list")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .find(|it| {
+                    it.get("dir").and_then(|v| v.as_bool()).unwrap_or(false)
+                        && it.get("file_name").and_then(|v| v.as_str()) == Some(name)
+                })
+                .and_then(|it| it.get("fid").and_then(|v| v.as_str()).map(|s| s.to_string()));
+            if let Some(fid) = found {
+                parent_id = fid;
+                continue;
+            }
+            let resp = self
+                .client
+                .get(format!("{HOST_URL}/v2/createFolder.action"))
+                .headers(self.cookie_header())
+                .query(&[("parentId", parent_id.as_str()), ("fileName", name)])
+                .send()
+                .await?;
+            let j: Value = resp.json().await.unwrap_or(json!({}));
+            let fid = j
+                .get("fileId")
+                .map(|v| v.to_string().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty());
+            let Some(fid) = fid else {
+                return Ok(json!({ "code": 1, "message": format!("创建目录失败: {name}"), "data": {}, "raw": j }));
+            };
+            parent_id = fid;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Ok(json!({ "code": 0, "message": "success", "data": { "fid": parent_id } }))
+    }
+
+    async fn get_fids(&self, file_paths: &[String]) -> anyhow::Result<Vec<Value>> {
+        let mut out = Vec::new();
+        for path in file_paths {
+            let mkdir = self.mkdir(path).await?;
+            let fid = mkdir
+                .pointer("/data/fid")
+                .map(|v| v.to_string().trim_matches('"').to_string())
+                .unwrap_or_default();
+            out.push(json!({ "file_path": path, "fid": fid }));
+        }
+        Ok(out)
+    }
+
+    async fn save_file(
+        &self,
+        fid_list: &[String],
+        fid_token_list: &[String],
+        to_pdir_fid: &str,
+        pwd_id: &str,
+        stoken: &str,
+    ) -> anyhow::Result<Value> {
+        if fid_list.is_empty() {
+            return Ok(json!({ "code": 0, "message": "success", "data": { "task_id": "" } }));
+        }
+        let mut access_code = String::new();
+        let mut share_id = String::new();
+        let mut share_mode = "3".to_string();
+        if let Ok(st) = serde_json::from_str::<Value>(stoken) {
+            access_code = st
+                .get("accessCode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            share_id = st
+                .get("shareId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            share_mode = st
+                .get("shareMode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("3")
+                .to_string();
+        } else if !stoken.is_empty() {
+            access_code = stoken.to_string();
+        }
+        if share_id.is_empty() {
+            if let Some(meta2) = self.get_share_info_by_code_v2(pwd_id).await? {
+                share_id = meta2
+                    .get("shareId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                share_mode = meta2
+                    .get("shareMode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&share_mode)
+                    .to_string();
+            }
+        }
+        if share_mode == "1" && share_id.is_empty() && !access_code.is_empty() {
+            if let Some(id) = self.check_access_code(pwd_id, &access_code).await? {
+                share_id = id;
+            }
+        }
+        if share_id.is_empty() {
+            return Ok(json!({ "code": 1, "message": "解析分享失败", "data": {} }));
+        }
+
+        let target = if to_pdir_fid.is_empty() || to_pdir_fid == "0" {
+            "-11"
+        } else {
+            to_pdir_fid
+        };
+        let mut task_infos = Vec::new();
+        for (i, fid) in fid_list.iter().enumerate() {
+            let token = fid_token_list.get(i).cloned().unwrap_or_default();
+            let (pid, is_folder, name) = if let Ok(t) = serde_json::from_str::<Value>(&token) {
+                (
+                    t.get("pid").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
+                    t.get("dir").and_then(|v| v.as_i64()).unwrap_or(0),
+                    t.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                )
+            } else {
+                ("0".into(), 0, String::new())
+            };
+            task_infos.push(json!({
+                "fileId": fid,
+                "srcParentId": pid,
+                "fileName": name,
+                "isFolder": is_folder
+            }));
+        }
+
+        let resp = self
+            .client
+            .post(format!("{HOST_URL}/createBatchTask.action"))
+            .headers(self.cookie_header())
+            .form(&[
+                ("type", "SHARE_SAVE"),
+                ("taskInfos", &serde_json::to_string(&task_infos).unwrap_or_else(|_| "[]".into())),
+                ("targetFolderId", target),
+                ("shareId", &share_id),
+            ])
+            .send()
+            .await?;
+        let text = resp.text().await.unwrap_or_default();
+        let mut task_id = text.trim().trim_matches('"').trim_matches('\'').to_string();
+        if let Ok(j) = serde_json::from_str::<Value>(&task_id) {
+            if let Some(id) = j.get("taskId").and_then(|v| v.as_str()) {
+                task_id = id.to_string();
+            }
+        }
+        if task_id.is_empty() {
+            return Ok(json!({ "code": 1, "message": "创建任务失败", "data": {}, "raw": text }));
+        }
+        Ok(json!({ "code": 0, "message": "success", "data": { "task_id": task_id } }))
+    }
+
+    async fn query_task(&self, task_id: &str) -> anyhow::Result<Value> {
+        if task_id.is_empty() {
+            return Ok(json!({ "code": 0, "data": { "status": 2, "save_as": { "save_as_top_fids": [] } } }));
+        }
+        for _ in 0..60 {
+            let resp = self
+                .client
+                .post(format!("{HOST_URL}/checkBatchTask.action"))
+                .headers(self.cookie_header())
+                .form(&[("type", "SHARE_SAVE"), ("taskId", task_id)])
+                .send()
+                .await?;
+            let j: Value = resp.json().await.unwrap_or(json!({}));
+            let task_status = j
+                .get("taskStatus")
+                .or_else(|| j.get("status"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1);
+            // cloud189: 4 often means success in batch check variants; also accept finished flags
+            let finished = j.get("finished").and_then(|v| v.as_bool()).unwrap_or(false)
+                || matches!(task_status, 2 | 4);
+            if finished {
+                return Ok(json!({ "status": 200, "code": 0, "data": { "status": 2, "raw": j } }));
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        Ok(json!({ "status": 200, "code": 0, "data": { "status": 1, "message": "timeout" } }))
+    }
+
     async fn get_stoken(&self, pwd_id: &str, passcode: &str) -> anyhow::Result<Value> {
         if pwd_id.is_empty() {
             return Ok(json!({ "status": 400, "message": "分享链接无效", "data": {} }));

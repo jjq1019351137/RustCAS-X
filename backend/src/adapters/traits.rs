@@ -54,6 +54,29 @@ pub trait CloudDriveAdapter: Send + Sync {
         }))
     }
 
+    async fn mkdir(&self, _dir_path: &str) -> anyhow::Result<Value> {
+        Ok(json!({ "code": -1, "message": format!("{} mkdir pending", self.drive_type()) }))
+    }
+
+    async fn get_fids(&self, _file_paths: &[String]) -> anyhow::Result<Vec<Value>> {
+        Ok(vec![])
+    }
+
+    async fn save_file(
+        &self,
+        _fid_list: &[String],
+        _fid_token_list: &[String],
+        _to_pdir_fid: &str,
+        _pwd_id: &str,
+        _stoken: &str,
+    ) -> anyhow::Result<Value> {
+        Ok(json!({ "code": -1, "message": format!("{} save_file pending", self.drive_type()) }))
+    }
+
+    async fn query_task(&self, _task_id: &str) -> anyhow::Result<Value> {
+        Ok(json!({ "status": 200, "data": { "status": 2 } }))
+    }
+
     fn config(&self) -> &HashMap<String, Value>;
 }
 
