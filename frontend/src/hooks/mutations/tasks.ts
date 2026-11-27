@@ -1,0 +1,112 @@
+import { useMutation, useQueryClient } from '@tanstack/vue-query'
+import {
+  createTask,
+  updateTask,
+  deleteTask,
+  runTask,
+  setTaskStatus,
+  repairBannedDramaTasks,
+  stopCompletedDramaTasks,
+  syncDramaSavepathSnapshots,
+  updateTaskSchedulerSetting,
+  runAllDramaTasks,
+  checkTaskShareUrls,
+  activateTaskShareUrl,
+} from '@/api/tasks'
+import type { TaskSchedulerSetting } from '@/types/tasks'
+
+export function useCreateTaskMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: createTask,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['tasks'] }),
+  })
+}
+
+export function useUpdateTaskMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ taskId, payload }: { taskId: number; payload: Parameters<typeof updateTask>[1] }) =>
+      updateTask(taskId, payload),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['tasks'] }),
+  })
+}
+
+export function useDeleteTaskMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: deleteTask,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['tasks'] }),
+  })
+}
+
+export function useRunTaskMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: runTask,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['tasks'] }),
+  })
+}
+
+export function useSetTaskStatusMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ taskId, enabled }: { taskId: number; enabled: boolean }) =>
+      setTaskStatus(taskId, enabled),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['tasks'] }),
+  })
+}
+
+export function useRepairBannedMutation() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: repairBannedDramaTasks,
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['tasks'] }) },
+  })
+}
+
+export function useStopCompletedMutation() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: stopCompletedDramaTasks,
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['tasks'] }) },
+  })
+}
+
+export function useSyncSnapshotsMutation() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: syncDramaSavepathSnapshots,
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['tasks'] }) },
+  })
+}
+
+export function useUpdateSchedulerMutation() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (data: Partial<TaskSchedulerSetting>) => updateTaskSchedulerSetting(data),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['task-scheduler-setting'] }) },
+  })
+}
+
+export function useRunAllTasksMutation() {
+  return useMutation({
+    mutationFn: runAllDramaTasks,
+  })
+}
+
+export function useCheckTaskShareUrlsMutation() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ taskId, shareurls }: { taskId: number; shareurls?: string[] }) => checkTaskShareUrls(taskId, shareurls),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['tasks'] }) },
+  })
+}
+
+export function useActivateTaskShareUrlMutation() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ taskId, shareurl }: { taskId: number; shareurl: string }) => activateTaskShareUrl(taskId, shareurl),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['tasks'] }) },
+  })
+}

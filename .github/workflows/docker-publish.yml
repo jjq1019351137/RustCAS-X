@@ -1,0 +1,160 @@
+name: Docker Publish
+
+permissions:
+  contents: write
+  packages: write
+
+# 仅 main/master 推送触发，避免标签推送重复构建。
+# 若该提交已打 v* 标签，仍会额外推送版本镜像与 latest。
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+env:
+  IMAGE_REPO: rustcas-x
+  ALIYUN_REGISTRY: registry.cn-hangzhou.aliyuncs.com
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve image name
+        id: image
+        run: |
+          user="${{ secrets.DOCKERHUB_USERNAME }}"
+          if [[ -z "$user" ]]; then
+            echo "::error::DOCKERHUB_USERNAME secret is not set"
+            exit 1
+          fi
+          echo "NAME=${user}/${IMAGE_REPO}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve version from git tag on this commit
+        id: get_version
+        run: |
+          exact_tag="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
+          if [[ "$exact_tag" == v* ]]; then
+            echo "VERSION=${exact_tag}" >> "$GITHUB_OUTPUT"
+            echo "HAS_RELEASE_TAG=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "HAS_RELEASE_TAG=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract metadata (tags, labels) for Docker Hub
+        id: meta_dockerhub
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ steps.image.outputs.NAME }}
+          tags: |
+            type=ref,event=branch
+            type=raw,value=${{ steps.get_version.outputs.VERSION }},enable=${{ steps.get_version.outputs.HAS_RELEASE_TAG == 'true' }}
+            type=raw,value=latest,enable=${{ steps.get_version.outputs.HAS_RELEASE_TAG == 'true' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      - name: Extract metadata (tags, labels) for Aliyun
+        id: meta_aliyun
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.ALIYUN_REGISTRY }}/${{ steps.image.outputs.NAME }}
+          tags: |
+            type=ref,event=branch
+            type=raw,value=${{ steps.get_version.outputs.VERSION }},enable=${{ steps.get_version.outputs.HAS_RELEASE_TAG == 'true' }}
+            type=raw,value=latest,enable=${{ steps.get_version.outputs.HAS_RELEASE_TAG == 'true' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker Hub image
+        uses: docker/build-push-action@v5
+        with:
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+            BUILD_TAG=${{ steps.get_version.outputs.VERSION }}
+          context: .
+          platforms: |
+            linux/amd64
+            linux/arm64
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta_dockerhub.outputs.tags }}
+          labels: ${{ steps.meta_dockerhub.outputs.labels }}
+
+      - name: Login to Aliyun with retry
+        id: aliyun_login
+        continue-on-error: true
+        env:
+          ALIYUN_USERNAME: ${{ secrets.ALIYUN_USERNAME }}
+          ALIYUN_TOKEN: ${{ secrets.ALIYUN_TOKEN }}
+        run: |
+          if [[ -z "${ALIYUN_USERNAME}" || -z "${ALIYUN_TOKEN}" ]]; then
+            echo "Aliyun credentials are not configured, skipping push."
+            exit 1
+          fi
+
+          for attempt in 1 2 3; do
+            if printf '%s' "${ALIYUN_TOKEN}" | docker login "${ALIYUN_REGISTRY}" --username "${ALIYUN_USERNAME}" --password-stdin; then
+              exit 0
+            fi
+            echo "Aliyun registry login failed (attempt ${attempt}/3), retrying..." >&2
+            sleep $((attempt * 15))
+          done
+
+          echo "Aliyun registry login failed after retries." >&2
+          exit 1
+
+      - name: Build and push Aliyun image
+        id: push_aliyun
+        if: steps.aliyun_login.outcome == 'success'
+        continue-on-error: true
+        uses: docker/build-push-action@v5
+        with:
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+            BUILD_TAG=${{ steps.get_version.outputs.VERSION }}
+          context: .
+          platforms: |
+            linux/amd64
+            linux/arm64
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta_aliyun.outputs.tags }}
+          labels: ${{ steps.meta_aliyun.outputs.labels }}
+
+      - name: Summarize Aliyun push status
+        if: always()
+        run: |
+          if [[ "${{ steps.aliyun_login.outcome }}" != "success" ]]; then
+            echo "Aliyun registry login skipped or failed; Docker Hub image has been published normally." >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${{ steps.push_aliyun.outcome }}" != "success" ]]; then
+            echo "Aliyun registry push failed; Docker Hub image has been published normally." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Docker Hub and Aliyun registry images were both published successfully." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Update repo description
+        uses: peter-evans/dockerhub-description@v4
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ steps.image.outputs.NAME }}
+          short-description: ${{ github.event.repository.description }}
+          enable-url-completion: true
