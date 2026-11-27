@@ -2,22 +2,20 @@
 
 cas-jjq / CAS 的 **Rust 后端迁移仓库**（Axum + SQLite + 原 Vue 前端）。
 
-## 现状（Wave 0）
+## 现状（Wave 0–5 骨架）
 
-已用 [rust-anything](https://rustanything.ai) 对原 Python 后端做整仓分析（见 `docs/rust-anything-analyze.md`）：约 **4.5 万行 / 129 单元**。
-
-本仓库当前可运行能力：
+已用 [rust-anything](https://rustanything.ai) 对原 Python 后端做整仓分析（见 `docs/rust-anything-analyze.md`）。
 
 | 模块 | 状态 |
 | --- | --- |
-| `/api/health` | 已实现 |
-| `/api/setup/*` | 已实现（初始化管理员） |
-| `/api/auth/*` | 已实现（login/refresh/logout/me，bcrypt + JWT） |
-| `/api/dashboard/overview` | 已实现 |
-| `/api/tasks` / `/api/sync-tasks` | 列表只读骨架 |
-| 驱动 / 追剧执行 / 同步执行 / TMDB / OpenList | **未迁移**（API stub，前端可启动） |
+| auth / setup / health / users / roles | 已实现 |
+| drive-accounts CRUD + types（quark/cloud189） | 已实现；`extract_url` 已移植 |
+| tasks / sync-tasks 创建 + run/stream | 骨架可跑（execution 落库） |
+| deferred sync delete 队列 | 已实现（本地路径） |
+| TMDB / OpenList settings；OpenList browse | 已实现 |
+| 适配器 lsdir/转存、追剧全流程、双向同步全量 | **进行中** |
 
-后续按 rust-anything 波次继续移植适配器与 runtime。
+详见 `docs/MIGRATION.md`。
 
 ## 本地开发
 

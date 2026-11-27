@@ -1,9 +1,12 @@
+mod adapters;
 mod auth_ctx;
 mod config;
 mod db;
 mod error;
 mod routes;
+mod runtime;
 mod security;
+mod settings_store;
 mod state;
 
 use crate::config::Settings;
@@ -40,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
         db: pool,
         settings: Arc::new(settings.clone()),
     };
+    runtime::spawn_background(state.clone());
 
     let api = routes::api_router(state);
     let app = Router::new()

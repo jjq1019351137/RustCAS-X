@@ -28,6 +28,13 @@ uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 mime = "0.3"
 time = { version = "0.3", features = ["serde"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+url = "2"
+urlencoding = "2"
+futures-util = "0.3"
+tokio-stream = "0.1"
+async-trait = "0.1"
 
 [profile.release]
 lto = true
