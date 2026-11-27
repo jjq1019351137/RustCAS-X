@@ -1,22 +1,59 @@
 use crate::adapters::create_adapter;
+use crate::services::episode::{
+    format_episode_anchor, is_before_start_episode, name_exists_in_dest, parse_episode_anchor,
+    resolve_start_episode_key,
+};
+use crate::services::rename::{matches_pattern, rename_preview};
+use crate::services::tmdb::{self, TmdbClient};
 use crate::state::AppState;
 use chrono::Utc;
 use serde_json::{json, Value};
 
-/// Drama run: init → extract → stoken → detail → mkdir(savepath) → save_file → query_task.
+/// Drama run: init → extract → stoken → detail → filter → mkdir → save → query_task.
 pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, String)> {
     let row = sqlx::query_as::<
         _,
-        (String, Option<String>, Option<String>, Option<String>, Option<String>),
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        ),
     >(
-        "SELECT taskname, shareurl, savepath, account_name, tmdb_media_type FROM tasks WHERE id = ?",
+        r#"
+        SELECT taskname, shareurl, savepath, account_name, tmdb_media_type,
+               pattern, "replace", startfid, tmdb_id, ignore_extension
+        FROM tasks WHERE id = ?
+        "#,
     )
     .bind(task_id)
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| anyhow::anyhow!("task not found"))?;
 
-    let (taskname, shareurl, savepath, account_name, _media) = row;
+    let (
+        taskname,
+        shareurl,
+        savepath,
+        account_name,
+        media_type,
+        pattern,
+        replace,
+        startfid,
+        tmdb_id,
+        ignore_extension,
+    ) = row;
+    let pattern = pattern.unwrap_or_default();
+    let replace = replace.unwrap_or_default();
+    let startfid = startfid.unwrap_or_default();
+    let ignore_ext = ignore_extension.unwrap_or(0) != 0;
+
     let exec_id = sqlx::query_scalar::<_, i64>(
         r#"
         INSERT INTO task_executions (task_id, status, stage, message, run_log, started_at)
@@ -32,6 +69,34 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
 
     let mut log = String::new();
     log.push_str(&format!("[{}] start task={taskname}\n", Utc::now().to_rfc3339()));
+
+    let tmdb_cfg = tmdb::load_config(state).await.unwrap_or_default();
+    let mut series_title: Option<String> = None;
+    if tmdb_cfg.configured() {
+        if let Some(id) = tmdb_id.filter(|v| *v > 0) {
+            let client = TmdbClient::new(&tmdb_cfg);
+            let mt = media_type.as_deref().unwrap_or("tv").to_lowercase();
+            let details = if mt == "movie" {
+                client.get_movie_details(id).await.ok().flatten()
+            } else {
+                client.get_tv_details(id).await.ok().flatten()
+            };
+            if let Some(d) = details.as_ref() {
+                series_title = tmdb::media_title(d);
+                let weekdays = tmdb::infer_weekdays_from_details(d);
+                log.push_str(&format!(
+                    "tmdb id={id} title={:?} year={:?} weekdays={:?}\n",
+                    series_title,
+                    tmdb::media_year(d),
+                    weekdays
+                ));
+            } else {
+                log.push_str(&format!("tmdb fetch miss id={id}\n"));
+            }
+        }
+    } else {
+        log.push_str("tmdb: api_key not configured\n");
+    }
 
     let account_row = if let Some(name) = account_name.as_ref().filter(|s| !s.trim().is_empty()) {
         sqlx::query_as::<_, (String, String, Option<String>)>(
@@ -143,49 +208,127 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
     };
     log.push_str(&format!("dest_fid={dest_fid}\n"));
 
+    // Dest file names for skip-existing
+    let dest_list = adapter.ls_dir(&dest_fid, 500).await.unwrap_or(json!({}));
+    let dest_names: Vec<String> = dest_list
+        .pointer("/data/list")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|it| {
+            let is_dir = it
+                .get("dir")
+                .or_else(|| it.get("is_dir"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if is_dir {
+                return None;
+            }
+            item_name(it)
+        })
+        .collect();
+    log.push_str(&format!("dest existing files={}\n", dest_names.len()));
+
+    let share_fid_names: Vec<(String, String)> = items
+        .iter()
+        .filter_map(|it| {
+            let fid = item_fid(it)?;
+            let name = item_name(it)?;
+            Some((fid, name))
+        })
+        .collect();
+
+    let start_key = resolve_start_episode_key(&startfid, &share_fid_names);
+    if !startfid.trim().is_empty() && start_key.is_none() {
+        log.push_str(&format!("提示: 起始锚点无法解析为集数，已忽略 start={startfid}\n"));
+    } else if let Some(sk) = start_key {
+        log.push_str(&format!(
+            "起始集数过滤: >= {} (原始={startfid})\n",
+            format_episode_anchor(sk.0, sk.1)
+        ));
+    }
+    if !pattern.trim().is_empty() {
+        log.push_str(&format!(
+            "pattern filter len={} replace_len={}\n",
+            pattern.len(),
+            replace.len()
+        ));
+    }
+
+    let tv_tpl = tmdb_cfg.guessit_tmdb_tv_rename_template.clone();
+    let disable_fb = tmdb_cfg.disable_guessit_tmdb_fallback_rename;
+
     let mut fid_list = Vec::new();
     let mut token_list = Vec::new();
+    let mut skipped_pattern = 0usize;
+    let mut skipped_start = 0usize;
+    let mut skipped_exist = 0usize;
+
     for item in &items {
-        let fid = item
-            .get("fid")
-            .or_else(|| item.get("file_id"))
-            .or_else(|| item.get("fileId"))
-            .map(|v| v.to_string().trim_matches('"').to_string())
-            .filter(|s| !s.is_empty());
-        let Some(fid) = fid else { continue };
+        let is_dir = item
+            .get("dir")
+            .or_else(|| item.get("is_dir"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if is_dir {
+            continue;
+        }
+        let Some(fid) = item_fid(item) else { continue };
+        let Some(name) = item_name(item) else { continue };
+
+        if !matches_pattern(&name, &pattern) {
+            skipped_pattern += 1;
+            continue;
+        }
+
+        let renamed = rename_preview(
+            &name,
+            &pattern,
+            &replace,
+            series_title.as_deref(),
+            Some(tv_tpl.as_str()),
+            disable_fb,
+        );
+
+        if start_key.is_some() {
+            let file_key = parse_episode_anchor(&renamed).or_else(|| parse_episode_anchor(&name));
+            if is_before_start_episode(file_key, start_key) {
+                skipped_start += 1;
+                continue;
+            }
+        }
+
+        if name_exists_in_dest(&renamed, &dest_names, ignore_ext)
+            || name_exists_in_dest(&name, &dest_names, ignore_ext)
+        {
+            skipped_exist += 1;
+            log.push_str(&format!("跳过已存在: {name} -> {renamed}\n"));
+            continue;
+        }
+
         let token = item
             .get("share_fid_token")
             .or_else(|| item.get("shareFidToken"))
             .map(|v| v.as_str().unwrap_or("").to_string())
             .unwrap_or_default();
-        // For cloud189, encode helper token JSON when missing
         let token = if token.is_empty() && drive_type == "cloud189" {
-            let name = item
-                .get("file_name")
-                .or_else(|| item.get("fileName"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let dir = if item.get("dir").and_then(|v| v.as_bool()).unwrap_or(false) {
-                1
-            } else {
-                0
-            };
-            json!({ "pid": "0", "dir": dir, "name": name }).to_string()
+            json!({ "pid": "0", "dir": 0, "name": name }).to_string()
         } else {
             token
         };
-        let name = item
-            .get("file_name")
-            .or_else(|| item.get("fileName"))
-            .or_else(|| item.get("title"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        log.push_str(&format!("save candidate: {name} ({fid})\n"));
+
+        log.push_str(&format!("save candidate: {name} -> {renamed} ({fid})\n"));
         fid_list.push(fid);
         token_list.push(token);
     }
+
+    log.push_str(&format!(
+        "filter: keep={} skip_pattern={skipped_pattern} skip_start={skipped_start} skip_exist={skipped_exist}\n",
+        fid_list.len()
+    ));
+
     if fid_list.is_empty() {
-        return finish(state, exec_id, "skipped", "no transferable fids", &mut log).await;
+        return finish(state, exec_id, "skipped", "no new files to transfer", &mut log).await;
     }
 
     log.push_str(&format!("save_file count={}\n", fid_list.len()));
@@ -217,7 +360,6 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
             .get("message")
             .and_then(|v| v.as_str())
             .unwrap_or("save_file failed");
-        // quark may return status 200 without nested code
         let ok_save = matches!(
             save_ret.get("status").and_then(|v| v.as_i64()),
             Some(200)
@@ -227,9 +369,26 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
         }
     }
 
-    log.push_str("note: TMDB rename / episode filter still migrating\n");
     log.push_str(&format!("[{}] done\n", Utc::now().to_rfc3339()));
     finish(state, exec_id, "success", "transferred", &mut log).await
+}
+
+fn item_fid(item: &Value) -> Option<String> {
+    item.get("fid")
+        .or_else(|| item.get("file_id"))
+        .or_else(|| item.get("fileId"))
+        .map(|v| v.to_string().trim_matches('"').to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn item_name(item: &Value) -> Option<String> {
+    item.get("file_name")
+        .or_else(|| item.get("fileName"))
+        .or_else(|| item.get("title"))
+        .or_else(|| item.get("name"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn extract_stoken(resp: &Value) -> Option<String> {
@@ -238,7 +397,6 @@ fn extract_stoken(resp: &Value) -> Option<String> {
             return Some(s.to_string());
         }
     }
-    // object stoken serialized
     if let Some(obj) = resp.pointer("/data/stoken") {
         if obj.is_object() {
             return Some(obj.to_string());

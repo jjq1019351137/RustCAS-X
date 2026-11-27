@@ -6,6 +6,7 @@ mod error;
 mod routes;
 mod runtime;
 mod security;
+mod services;
 mod settings_store;
 mod state;
 
