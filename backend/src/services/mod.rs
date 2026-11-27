@@ -1,9 +1,11 @@
+pub mod douban;
 pub mod drama_repair;
 pub mod drive_util;
 pub mod episode;
 pub mod magic_rename;
 pub mod notify;
 pub mod openlist;
+pub mod proxy_image;
 pub mod rename;
 pub mod resource_search;
 pub mod share_cache;

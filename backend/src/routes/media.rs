@@ -1,9 +1,13 @@
-//! Frontend `/media/*` compatibility layer over TMDB (+ douban stubs).
+//! Frontend `/media/*` — TMDB search/detail, Douban discover, poster proxy.
 use crate::auth_ctx::{require_perm, CurrentUser};
 use crate::error::{AppError, AppResult};
+use crate::services::douban;
+use crate::services::proxy_image::{self, ProxyImageConfig};
 use crate::services::tmdb::{self, TmdbClient};
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -24,6 +28,11 @@ struct DoubanListQuery {
     sub_category: Option<String>,
     start: Option<i64>,
     limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct ProxyImageQuery {
+    url: String,
 }
 
 async fn search(
@@ -138,29 +147,7 @@ async fn detail(
 
 async fn douban_categories(user: CurrentUser) -> AppResult<Json<Value>> {
     require_perm(&user, "task:read")?;
-    Ok(Json(json!({
-        "categories": [
-            {
-                "key": "tv",
-                "label": "电视剧",
-                "media_type": "tv",
-                "subs": [
-                    {"key": "hot", "label": "热门"},
-                    {"key": "domestic", "label": "国产剧"},
-                    {"key": "variety", "label": "综艺"}
-                ]
-            },
-            {
-                "key": "movie",
-                "label": "电影",
-                "media_type": "movie",
-                "subs": [
-                    {"key": "hot", "label": "热门"},
-                    {"key": "latest", "label": "最新"}
-                ]
-            }
-        ]
-    })))
+    Ok(Json(douban::categories()))
 }
 
 async fn douban_list(
@@ -169,18 +156,79 @@ async fn douban_list(
     Query(q): Query<DoubanListQuery>,
 ) -> AppResult<Json<Value>> {
     require_perm(&user, "task:read")?;
-    let _ = (q.main_category, q.sub_category, q.start, q.limit);
+    let main = q.main_category.unwrap_or_else(|| "tv_drama".into());
+    let sub = q.sub_category.unwrap_or_default();
+    let mut out = douban::list(&main, &sub, q.start.unwrap_or(0), q.limit.unwrap_or(20)).await;
     let cfg = tmdb::load_config(&state).await.unwrap_or_default();
-    Ok(Json(json!({
-        "success": true,
-        "message": "豆瓣发现页尚未完整移植，请使用 TMDB 搜索",
-        "notice": "douban stub",
-        "tmdb_configured": cfg.configured(),
-        "is_mock_data": true,
-        "mock_reason": "douban not ported",
-        "total": 0,
-        "items": []
-    })))
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("tmdb_configured".into(), json!(cfg.configured()));
+        obj.insert("notice".into(), Value::Null);
+    }
+    Ok(Json(out))
+}
+
+async fn proxy_image(
+    State(state): State<AppState>,
+    Query(q): Query<ProxyImageQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let url = q.url.trim();
+    if url.len() < 8 || url.len() > 2048 || !proxy_image::host_allowed(url) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let cfg = ProxyImageConfig::from_data_dir(&state.settings.data_dir);
+    let cache_control = format!("public, max-age={}", cfg.ttl_seconds);
+
+    if let Some(cached) = proxy_image::try_read_cache(&cfg, url) {
+        if let Some(inm) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
+            if inm.split(',').any(|p| {
+                let p = p.trim();
+                p == "*" || p == cached.etag || p.trim_matches('"') == cached.etag.trim_matches('"')
+            }) {
+                return (
+                    StatusCode::NOT_MODIFIED,
+                    [
+                        (header::ETAG, cached.etag),
+                        (header::CACHE_CONTROL, cache_control),
+                    ],
+                )
+                    .into_response();
+            }
+        }
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, cached.content_type),
+                (header::ETAG, cached.etag),
+                (header::CACHE_CONTROL, cached.cache_control),
+            ],
+            cached.bytes,
+        )
+            .into_response();
+    }
+
+    match proxy_image::fetch_image(url).await {
+        Ok((bytes, ct)) => {
+            proxy_image::store_cache(&cfg, url, &ct, &bytes);
+            let etag = format!("\"{}\"", {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(url.as_bytes());
+                hex::encode(h.finalize())
+            });
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, ct),
+                    (header::ETAG, etag),
+                    (header::CACHE_CONTROL, cache_control),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 pub fn router() -> Router<AppState> {
@@ -188,5 +236,6 @@ pub fn router() -> Router<AppState> {
         .route("/search", get(search))
         .route("/douban/categories", get(douban_categories))
         .route("/douban/list", get(douban_list))
+        .route("/proxy-image", get(proxy_image))
         .route("/{media_type}/{id}", get(detail))
 }

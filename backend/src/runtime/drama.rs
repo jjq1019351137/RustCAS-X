@@ -17,6 +17,14 @@ use std::collections::HashSet;
 
 /// Drama run: init → extract → stoken → detail → filter → mkdir → save → query_task.
 pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, String)> {
+    run_once_inner(state, task_id, true).await
+}
+
+async fn run_once_inner(
+    state: &AppState,
+    task_id: i64,
+    allow_repair_retry: bool,
+) -> anyhow::Result<(i64, String)> {
     let row = sqlx::query_as::<
         _,
         (
@@ -250,14 +258,16 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 log.push_str(&format!("auto-repaired -> {new_url}\n"));
-                return finish(
-                    state,
-                    exec_id,
-                    "failed",
-                    &format!("share banned; auto-switched backup: {new_url}"),
-                    &mut log,
-                )
-                .await;
+                if allow_repair_retry {
+                    log.push_str("auto-repair: immediate re-run with new shareurl\n");
+                }
+                let note = format!("share banned; auto-switched backup: {new_url}");
+                let finished = finish(state, exec_id, "failed", &note, &mut log).await?;
+                if allow_repair_retry {
+                    tracing::info!(task_id, new_url, "drama auto-repair re-run");
+                    return Box::pin(run_once_inner(state, task_id, false)).await;
+                }
+                return Ok(finished);
             }
             Ok(None) => {
                 log.push_str("auto-repair: no usable backup\n");

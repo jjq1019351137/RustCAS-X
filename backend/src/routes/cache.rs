@@ -1,5 +1,6 @@
 use crate::auth_ctx::{require_perm, CurrentUser};
 use crate::error::{AppError, AppResult};
+use crate::services::proxy_image::{self, ProxyImageConfig};
 use crate::services::share_cache;
 use crate::state::AppState;
 use axum::extract::{Query, State};
@@ -131,6 +132,35 @@ async fn invalid_clear(
     Ok(Json(json!({ "deleted": n })))
 }
 
+async fn proxy_image_stats(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:read")?;
+    let cfg = ProxyImageConfig::from_data_dir(&state.settings.data_dir);
+    Ok(Json(proxy_image::stats(&cfg)))
+}
+
+async fn proxy_image_purge(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:write")?;
+    let cfg = ProxyImageConfig::from_data_dir(&state.settings.data_dir);
+    let (deleted_files, deleted_bytes) = proxy_image::purge_expired(&cfg);
+    Ok(Json(json!({ "deleted_files": deleted_files, "deleted_bytes": deleted_bytes })))
+}
+
+async fn proxy_image_clear(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:write")?;
+    let cfg = ProxyImageConfig::from_data_dir(&state.settings.data_dir);
+    let (deleted_files, deleted_bytes) = proxy_image::clear_all(&cfg);
+    Ok(Json(json!({ "deleted_files": deleted_files, "deleted_bytes": deleted_bytes })))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/share-preview-batch/list", get(preview_list))
@@ -140,4 +170,7 @@ pub fn router() -> Router<AppState> {
         .route("/invalid-share-links/list", get(invalid_list))
         .route("/invalid-share-links/item", delete(invalid_delete))
         .route("/invalid-share-links/clear", post(invalid_clear))
+        .route("/proxy-image/stats", get(proxy_image_stats))
+        .route("/proxy-image/purge", post(proxy_image_purge))
+        .route("/proxy-image/clear", post(proxy_image_clear))
 }
