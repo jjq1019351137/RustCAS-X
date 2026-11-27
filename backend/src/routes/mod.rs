@@ -3,6 +3,7 @@ mod dashboard;
 mod drive_accounts;
 mod health;
 mod magic_regex;
+mod notifications;
 mod openlist;
 mod roles;
 mod setup;
@@ -11,6 +12,7 @@ mod sync_tasks;
 mod system_settings;
 mod tasks;
 mod tmdb;
+mod tmdb_cache;
 mod users;
 
 use crate::state::AppState;
@@ -29,9 +31,10 @@ pub fn api_router(state: AppState) -> Router {
         .nest("/roles", roles::roles_router())
         .nest("/permissions", roles::permissions_router())
         .nest("/system-settings", system_settings::router())
-        .nest("/tmdb", tmdb::router())
+        .nest("/tmdb", tmdb::router().merge(tmdb_cache::router()))
         .nest("/magic-regex", magic_regex::router())
         .nest("/openlist", openlist::router())
+        .nest("/notifications", notifications::router())
         .merge(stubs::router())
         .with_state(state)
 }

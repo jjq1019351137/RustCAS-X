@@ -1024,14 +1024,15 @@ async fn savepath_snapshots_sync_stub(user: CurrentUser) -> AppResult<Json<Value
     })))
 }
 
-async fn repair_banned_stub(user: CurrentUser) -> AppResult<Json<Value>> {
+async fn repair_banned_tasks(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> AppResult<Json<Value>> {
     require_perm(&user, "task:write")?;
-    Ok(Json(json!({
-        "checked": 0,
-        "repaired": 0,
-        "items": [],
-        "note": "Quark auto-repair not ported yet"
-    })))
+    let out = crate::services::drama_repair::repair_banned_tasks(&state)
+        .await
+        .map_err(|e| AppError::bad_request("REPAIR_BANNED", e.to_string()))?;
+    Ok(Json(out))
 }
 
 async fn stop_completed_drama_tasks(
@@ -1314,7 +1315,7 @@ pub fn router() -> Router<AppState> {
         .route("/import", post(import_tasks))
         .route("/run-all", post(run_all_tasks))
         .route("/run-all/stream", post(run_all_tasks_stream))
-        .route("/repair-banned", post(repair_banned_stub))
+        .route("/repair-banned", post(repair_banned_tasks))
         .route("/drama/stop-completed", post(stop_completed_drama_tasks))
         .route("/drama/savepath-snapshots/sync", post(savepath_snapshots_sync_stub))
         .route("/suggestions", get(suggestions_stub))
