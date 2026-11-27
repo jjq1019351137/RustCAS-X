@@ -651,12 +651,73 @@ async fn ls_dir(
     Ok(Json(out))
 }
 
+async fn cloud189_families_stub(
+    user: CurrentUser,
+    Path(account_id): Path<i64>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "drive_account:read")?;
+    Ok(Json(json!({
+        "items": [],
+        "account_id": account_id,
+        "note": "cloud189 families not ported (Quark-first)"
+    })))
+}
+
+async fn cloud189_not_ported_write(user: CurrentUser) -> AppResult<Json<Value>> {
+    require_perm(&user, "drive_account:write")?;
+    Err(AppError::bad_request(
+        "CLOUD189_NOT_PORTED",
+        "天翼账密/扫码登录已放弃深度迁移，请使用夸克 Cookie 账号",
+    ))
+}
+
+async fn cloud189_auth_account_stub(
+    user: CurrentUser,
+    Path(_account_id): Path<i64>,
+) -> AppResult<Json<Value>> {
+    cloud189_not_ported_write(user).await
+}
+
+async fn cloud189_auth_session_stub(
+    user: CurrentUser,
+    Path(_session_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    cloud189_not_ported_write(user).await
+}
+
+async fn sign_in_stub(user: CurrentUser, Path(account_id): Path<i64>) -> AppResult<Json<Value>> {
+    require_perm(&user, "drive_account:write")?;
+    Ok(Json(json!({
+        "status": "skipped",
+        "message": "sign-in not required for Quark Cookie accounts",
+        "account_id": account_id,
+        "result": null,
+        "error": null
+    })))
+}
+
+async fn sign_in_job_stub(user: CurrentUser, Path(job_id): Path<String>) -> AppResult<Json<Value>> {
+    require_perm(&user, "drive_account:read")?;
+    Ok(Json(json!({
+        "status": "done",
+        "message": format!("noop job {job_id}"),
+        "result": null,
+        "error": null
+    })))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/types", get(list_types))
         .route("/lsdir-cache/status", get(lsdir_cache_status))
         .route("/probe/scheduler", get(get_probe_scheduler).patch(patch_probe_scheduler))
         .route("/refresh-profiles", post(refresh_profiles))
+        .route("/sign-in-jobs/{job_id}", get(sign_in_job_stub))
+        .route("/auth/{session_id}", get(cloud189_auth_session_stub))
+        .route("/auth/{session_id}/qrcode/poll", post(cloud189_auth_session_stub))
+        .route("/auth/{session_id}/captcha", post(cloud189_auth_session_stub))
+        .route("/auth/{session_id}/sms/send", post(cloud189_auth_session_stub))
+        .route("/auth/{session_id}/sms/submit", post(cloud189_auth_session_stub))
         .route("/", get(list_accounts).post(create_account))
         .route("/{account_id}", patch(patch_account).delete(delete_account))
         .route("/{account_id}/status", patch(patch_status))
@@ -665,4 +726,8 @@ pub fn router() -> Router<AppState> {
         .route("/{account_id}/lsdir-cache/refresh", post(lsdir_cache_refresh))
         .route("/{account_id}/extract-url", post(extract_share))
         .route("/{account_id}/lsdir", post(ls_dir))
+        .route("/{account_id}/cloud189/families", get(cloud189_families_stub))
+        .route("/{account_id}/sign-in", post(sign_in_stub))
+        .route("/{account_id}/auth/start", post(cloud189_auth_account_stub))
+        .route("/{account_id}/auth/qrcode/start", post(cloud189_auth_account_stub))
 }

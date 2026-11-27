@@ -28,9 +28,12 @@
 
 - [ ] local→local 复制文件
 - [ ] strategy.`one_way_delete_extras`：目标多余文件进入延时删除队列
+- [ ] strategy.`openlist_copy_batch_size` / `request_interval_seconds` 生效
+- [ ] 执行中取消：状态变为 cancelled，任务 `is_running=0`
 - [ ] local↔openlist / openlist→openlist（需先配 OpenList）
 - [ ] 执行文件列表 `sync_execution_files` 有记录
 - [ ] 完成后有通知（若已开启渠道）
+- [ ] 天翼 families/登录入口返回友好提示（非裸 404）
 
 ## 通知
 

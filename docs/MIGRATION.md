@@ -23,6 +23,7 @@
 | 8 | 审计列表/写入、插件空注册表、网盘探针调度 | **done** |
 | 9 | 同步/设置类写操作审计补齐 | **done** |
 | 10 | Sync `one_way_delete_extras` + webhook 头 + 回归清单 | **done** |
+| 11 | Sync 可取消 / batch / interval；天翼 API 友好 stub | **done** |
 
 ## Quark-first 约定
 

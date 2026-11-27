@@ -5,6 +5,38 @@ use chrono::Utc;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+const CANCEL_MARK: &str = "__SYNC_CANCELLED__";
+
+#[derive(Clone, Copy)]
+struct SyncOpts {
+    exec_id: i64,
+    overwrite: bool,
+    delete_extras: bool,
+    delete_delay_secs: i64,
+    concurrency: usize,
+    batch_size: usize,
+    request_interval_ms: u64,
+}
+
+async fn is_cancelled(state: &AppState, exec_id: i64) -> bool {
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM sync_executions WHERE id = ?")
+            .bind(exec_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+    matches!(status.as_deref(), Some("cancelled"))
+}
+
+async fn ensure_not_cancelled(state: &AppState, exec_id: i64) -> anyhow::Result<()> {
+    if is_cancelled(state, exec_id).await {
+        anyhow::bail!("{CANCEL_MARK}");
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 struct FileEvent {
@@ -103,8 +135,33 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
         .unwrap_or(5)
         .max(0)
         * 60;
+    let concurrency = strategy
+        .get("concurrency")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+        .clamp(1, 8) as usize;
+    let batch_size = strategy
+        .get("openlist_copy_batch_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50)
+        .clamp(1, 200) as usize;
+    let request_interval_ms = (strategy
+        .get("request_interval_seconds")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0)
+        .max(0.0)
+        * 1000.0) as u64;
+    let opts = SyncOpts {
+        exec_id,
+        overwrite,
+        delete_extras,
+        delete_delay_secs,
+        concurrency,
+        batch_size,
+        request_interval_ms,
+    };
     log.push_str(&format!(
-        "strategy overwrite={overwrite} delete_extras={delete_extras} delay_secs={delete_delay_secs}\n"
+        "strategy overwrite={overwrite} delete_extras={delete_extras} delay_secs={delete_delay_secs} concurrency={concurrency} batch={batch_size} interval_ms={request_interval_ms}\n"
     ));
 
     let result_status;
@@ -113,18 +170,8 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
         ("local", "local") => {
             let src_rel = source.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let dst_rel = target.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            match sync_local_to_local(
-                state,
-                &uid,
-                src_rel,
-                dst_rel,
-                overwrite,
-                delete_extras,
-                delete_delay_secs,
-                &mut log,
-                &mut file_events,
-            )
-            .await
+            match sync_local_to_local(state, &uid, src_rel, dst_rel, opts, &mut log, &mut file_events)
+                .await
             {
                 Ok((copied, skipped, dirs, deleted)) => {
                     result_status = "success";
@@ -132,6 +179,11 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
                         "local→local copied={copied} skipped={skipped} dirs={dirs} deleted={deleted}"
                     );
                     log.push_str(&format!("{result_msg}\n"));
+                }
+                Err(e) if e.to_string().contains(CANCEL_MARK) => {
+                    result_status = "cancelled";
+                    result_msg = "cancelled".into();
+                    log.push_str("cancelled by user\n");
                 }
                 Err(e) => {
                     result_status = "failed";
@@ -143,16 +195,8 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
         ("local", "openlist") => {
             let src_rel = source.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let dst_rel = target.get("path").and_then(|v| v.as_str()).unwrap_or("/");
-            match sync_local_to_openlist(
-                state,
-                src_rel,
-                dst_rel,
-                overwrite,
-                delete_extras,
-                &mut log,
-                &mut file_events,
-            )
-            .await
+            match sync_local_to_openlist(state, src_rel, dst_rel, opts, &mut log, &mut file_events)
+                .await
             {
                 Ok((copied, skipped, deleted)) => {
                     result_status = "success";
@@ -160,6 +204,11 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
                         "local→openlist uploaded={copied} skipped={skipped} deleted={deleted}"
                     );
                     log.push_str(&format!("{result_msg}\n"));
+                }
+                Err(e) if e.to_string().contains(CANCEL_MARK) => {
+                    result_status = "cancelled";
+                    result_msg = "cancelled".into();
+                    log.push_str("cancelled by user\n");
                 }
                 Err(e) => {
                     result_status = "failed";
@@ -176,9 +225,7 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
                 &uid,
                 src_rel,
                 dst_rel,
-                overwrite,
-                delete_extras,
-                delete_delay_secs,
+                opts,
                 &mut log,
                 &mut file_events,
             )
@@ -191,6 +238,11 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
                     );
                     log.push_str(&format!("{result_msg}\n"));
                 }
+                Err(e) if e.to_string().contains(CANCEL_MARK) => {
+                    result_status = "cancelled";
+                    result_msg = "cancelled".into();
+                    log.push_str("cancelled by user\n");
+                }
                 Err(e) => {
                     result_status = "failed";
                     result_msg = e.to_string();
@@ -201,16 +253,8 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
         ("openlist", "openlist") => {
             let src_rel = source.get("path").and_then(|v| v.as_str()).unwrap_or("/");
             let dst_rel = target.get("path").and_then(|v| v.as_str()).unwrap_or("/");
-            match sync_openlist_to_openlist(
-                state,
-                src_rel,
-                dst_rel,
-                overwrite,
-                delete_extras,
-                &mut log,
-                &mut file_events,
-            )
-            .await
+            match sync_openlist_to_openlist(state, src_rel, dst_rel, opts, &mut log, &mut file_events)
+                .await
             {
                 Ok((copied, skipped, deleted)) => {
                     result_status = "success";
@@ -218,6 +262,11 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
                         "openlist→openlist copied={copied} skipped={skipped} deleted={deleted}"
                     );
                     log.push_str(&format!("{result_msg}\n"));
+                }
+                Err(e) if e.to_string().contains(CANCEL_MARK) => {
+                    result_status = "cancelled";
+                    result_msg = "cancelled".into();
+                    log.push_str("cancelled by user\n");
                 }
                 Err(e) => {
                     result_status = "failed";
@@ -246,15 +295,27 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
     log.push_str(&format!("[{}] done\n", Utc::now().to_rfc3339()));
     flush_file_events(state, exec_id, &file_events).await;
 
+    let already_cancelled = is_cancelled(state, exec_id).await;
+    let final_status = if already_cancelled {
+        "cancelled"
+    } else {
+        result_status
+    };
+    let final_msg = if already_cancelled && result_status != "cancelled" {
+        "cancelled by user".to_string()
+    } else {
+        result_msg
+    };
+
     sqlx::query(
         r#"
         UPDATE sync_executions
-        SET status=?, message=?, run_log=?, finished_at=?
+        SET status=?, message=?, run_log=?, finished_at=COALESCE(finished_at, ?)
         WHERE id=?
         "#,
     )
-    .bind(result_status)
-    .bind(&result_msg)
+    .bind(final_status)
+    .bind(&final_msg)
     .bind(&log)
     .bind(Utc::now().to_rfc3339())
     .bind(exec_id)
@@ -267,11 +328,11 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
         .execute(&state.db)
         .await?;
 
-    if result_status == "success" || result_status == "failed" {
+    if final_status == "success" || final_status == "failed" {
         crate::services::notify::send_runtime(
             state,
-            &format!("同步任务{result_status}"),
-            &format!("任务: {name}\n执行ID: {exec_id}\n结果: {result_msg}"),
+            &format!("同步任务{final_status}"),
+            &format!("任务: {name}\n执行ID: {exec_id}\n结果: {final_msg}"),
         )
         .await;
     }
@@ -319,21 +380,21 @@ async fn sync_local_to_local(
     sync_uid: &str,
     src_rel: &str,
     dst_rel: &str,
-    overwrite: bool,
-    delete_extras: bool,
-    delete_delay_secs: i64,
+    opts: SyncOpts,
     log: &mut String,
     events: &mut Vec<FileEvent>,
 ) -> anyhow::Result<(usize, usize, usize, usize)> {
+    ensure_not_cancelled(state, opts.exec_id).await?;
     let root = sync_root(state);
     fs::create_dir_all(&root)?;
     let src = resolve_under(&root, src_rel)?;
     let dst = resolve_under(&root, dst_rel)?;
     log.push_str(&format!(
-        "local root={} src={} dst={} overwrite={overwrite}\n",
+        "local root={} src={} dst={} overwrite={}\n",
         root.display(),
         src.display(),
-        dst.display()
+        dst.display(),
+        opts.overwrite
     ));
 
     if !src.exists() {
@@ -342,7 +403,7 @@ async fn sync_local_to_local(
     if src.is_file() {
         fs::create_dir_all(dst.parent().unwrap_or(Path::new(".")))?;
         let size = fs::metadata(&src).ok().map(|m| m.len() as i64);
-        let outcome = copy_one_file(&src, &dst, overwrite)?;
+        let outcome = copy_one_file(&src, &dst, opts.overwrite)?;
         let (c, s) = match outcome {
             CopyOutcome::Copied => {
                 events.push(FileEvent {
@@ -379,21 +440,23 @@ async fn sync_local_to_local(
     walk_copy(
         &src,
         &dst,
-        overwrite,
+        opts.overwrite,
         &mut copied,
         &mut skipped,
         &mut dirs,
         log,
         events,
     )?;
+    ensure_not_cancelled(state, opts.exec_id).await?;
 
     let mut deleted = 0usize;
-    if delete_extras {
+    if opts.delete_extras {
         let src_files = collect_local_files(&src)?;
         let src_set: std::collections::HashSet<String> =
             src_files.into_iter().map(|(rel, _, _)| rel).collect();
         let dst_files = collect_local_files(&dst)?;
         for (rel, size, _) in dst_files {
+            ensure_not_cancelled(state, opts.exec_id).await?;
             if src_set.contains(&rel) {
                 continue;
             }
@@ -402,14 +465,15 @@ async fn sync_local_to_local(
                 Some(sync_uid),
                 &dst.to_string_lossy(),
                 &rel,
-                delete_delay_secs,
+                opts.delete_delay_secs,
             )
             .await
             {
                 Ok(id) => {
                     deleted += 1;
                     log.push_str(&format!(
-                        "enqueue delete extra {rel} (id={id} delay={delete_delay_secs}s)\n"
+                        "enqueue delete extra {rel} (id={id} delay={}s)\n",
+                        opts.delete_delay_secs
                     ));
                     events.push(FileEvent {
                         path: dst.join(&rel).display().to_string(),
@@ -575,11 +639,11 @@ async fn sync_local_to_openlist(
     state: &AppState,
     src_rel: &str,
     dst_rel: &str,
-    overwrite: bool,
-    delete_extras: bool,
+    opts: SyncOpts,
     log: &mut String,
     events: &mut Vec<FileEvent>,
 ) -> anyhow::Result<(usize, usize, usize)> {
+    ensure_not_cancelled(state, opts.exec_id).await?;
     let client = openlist_client(state).await?;
     let root = sync_root(state);
     fs::create_dir_all(&root)?;
@@ -600,43 +664,55 @@ async fn sync_local_to_openlist(
     let src_set: std::collections::HashSet<String> =
         files.iter().map(|(rel, _, _)| rel.clone()).collect();
 
-    let mut copied = 0usize;
+    let mut pending: Vec<(String, u64, PathBuf)> = Vec::new();
     let mut skipped = 0usize;
-    for (rel, size, local) in &files {
-        let remote = join_remote(dst_rel, rel);
-        if let Some(rs) = remote_map.get(rel) {
-            if !overwrite || *rs == *size {
+    for (rel, size, local) in files {
+        if let Some(rs) = remote_map.get(&rel) {
+            if !opts.overwrite || *rs == size {
                 skipped += 1;
                 events.push(FileEvent {
-                    path: remote.clone(),
+                    path: join_remote(dst_rel, &rel),
                     action: "upload".into(),
                     status: "skipped".into(),
-                    size: Some(*size as i64),
+                    size: Some(size as i64),
                     message: None,
                 });
                 continue;
             }
         }
-        if let Some(parent) = Path::new(&remote).parent() {
-            let parent_s = parent.to_string_lossy().replace('\\', "/");
-            if parent_s != "/" && !parent_s.is_empty() {
-                let _ = client.ensure_dir(&parent_s).await;
+        pending.push((rel, size, local));
+    }
+
+    let mut copied = 0usize;
+    for chunk in pending.chunks(opts.concurrency.max(1)) {
+        ensure_not_cancelled(state, opts.exec_id).await?;
+        for (rel, size, local) in chunk {
+            let remote = join_remote(dst_rel, rel);
+            if let Some(parent) = Path::new(&remote).parent() {
+                let parent_s = parent.to_string_lossy().replace('\\', "/");
+                if parent_s != "/" && !parent_s.is_empty() {
+                    let _ = client.ensure_dir(&parent_s).await;
+                }
+            }
+            client.put_file(&remote, local).await?;
+            copied += 1;
+            log.push_str(&format!("uploaded {rel}\n"));
+            events.push(FileEvent {
+                path: remote,
+                action: "upload".into(),
+                status: "ok".into(),
+                size: Some(*size as i64),
+                message: None,
+            });
+            if opts.request_interval_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(opts.request_interval_ms)).await;
             }
         }
-        client.put_file(&remote, local).await?;
-        copied += 1;
-        log.push_str(&format!("uploaded {rel}\n"));
-        events.push(FileEvent {
-            path: remote,
-            action: "upload".into(),
-            status: "ok".into(),
-            size: Some(*size as i64),
-            message: None,
-        });
     }
 
     let mut deleted = 0usize;
-    if delete_extras {
+    if opts.delete_extras {
+        ensure_not_cancelled(state, opts.exec_id).await?;
         deleted = remove_openlist_extras(&client, dst_rel, &src_set, log, events).await?;
     }
     Ok((copied, skipped, deleted))
@@ -647,12 +723,11 @@ async fn sync_openlist_to_local(
     sync_uid: &str,
     src_rel: &str,
     dst_rel: &str,
-    overwrite: bool,
-    delete_extras: bool,
-    delete_delay_secs: i64,
+    opts: SyncOpts,
     log: &mut String,
     events: &mut Vec<FileEvent>,
 ) -> anyhow::Result<(usize, usize, usize)> {
+    ensure_not_cancelled(state, opts.exec_id).await?;
     let client = openlist_client(state).await?;
     let root = sync_root(state);
     fs::create_dir_all(&root)?;
@@ -668,6 +743,7 @@ async fn sync_openlist_to_local(
     let mut copied = 0usize;
     let mut skipped = 0usize;
     for (rel, size) in &files {
+        ensure_not_cancelled(state, opts.exec_id).await?;
         let local = {
             let mut p = dst.to_path_buf();
             for part in rel.split('/') {
@@ -679,7 +755,7 @@ async fn sync_openlist_to_local(
         };
         if local.exists() {
             let ls = fs::metadata(&local)?.len();
-            if !overwrite || ls == *size {
+            if !opts.overwrite || ls == *size {
                 skipped += 1;
                 events.push(FileEvent {
                     path: local.display().to_string(),
@@ -702,12 +778,16 @@ async fn sync_openlist_to_local(
             size: Some(*size as i64),
             message: None,
         });
+        if opts.request_interval_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(opts.request_interval_ms)).await;
+        }
     }
 
     let mut deleted = 0usize;
-    if delete_extras {
+    if opts.delete_extras {
         let dst_files = collect_local_files(&dst)?;
         for (rel, size, _) in dst_files {
+            ensure_not_cancelled(state, opts.exec_id).await?;
             if src_set.contains(&rel) {
                 continue;
             }
@@ -716,14 +796,15 @@ async fn sync_openlist_to_local(
                 Some(sync_uid),
                 &dst.to_string_lossy(),
                 &rel,
-                delete_delay_secs,
+                opts.delete_delay_secs,
             )
             .await
             {
                 Ok(id) => {
                     deleted += 1;
                     log.push_str(&format!(
-                        "enqueue delete extra {rel} (id={id} delay={delete_delay_secs}s)\n"
+                        "enqueue delete extra {rel} (id={id} delay={}s)\n",
+                        opts.delete_delay_secs
                     ));
                     events.push(FileEvent {
                         path: dst.join(&rel).display().to_string(),
@@ -746,11 +827,11 @@ async fn sync_openlist_to_openlist(
     state: &AppState,
     src_rel: &str,
     dst_rel: &str,
-    overwrite: bool,
-    delete_extras: bool,
+    opts: SyncOpts,
     log: &mut String,
     events: &mut Vec<FileEvent>,
 ) -> anyhow::Result<(usize, usize, usize)> {
+    ensure_not_cancelled(state, opts.exec_id).await?;
     let client = openlist_client(state).await?;
     log.push_str(&format!("openlist→openlist src={src_rel} dst={dst_rel}\n"));
     client.ensure_dir(dst_rel).await?;
@@ -766,7 +847,7 @@ async fn sync_openlist_to_openlist(
     for (rel, size) in files {
         let remote = join_remote(dst_rel, &rel);
         if let Some(rs) = dst_map.get(&rel) {
-            if !overwrite || *rs == size {
+            if !opts.overwrite || *rs == size {
                 skipped += 1;
                 events.push(FileEvent {
                     path: remote,
@@ -793,6 +874,7 @@ async fn sync_openlist_to_openlist(
 
     let mut copied = 0usize;
     for (parent, items) in &by_dir {
+        ensure_not_cancelled(state, opts.exec_id).await?;
         let src_dir = if parent.is_empty() {
             openlist::normalize_abs(src_rel)
         } else {
@@ -804,38 +886,48 @@ async fn sync_openlist_to_openlist(
             join_remote(dst_rel, parent)
         };
         client.ensure_dir(&dst_dir).await?;
-        let names: Vec<String> = items.iter().map(|(_, n)| n.clone()).collect();
-        match client.fs_copy(&src_dir, &dst_dir, &names, overwrite).await {
-            Ok(_) => {
-                copied += names.len();
-                for (rel, _) in items {
-                    log.push_str(&format!("copied {rel}\n"));
-                    events.push(FileEvent {
-                        path: join_remote(dst_rel, rel),
-                        action: "copy".into(),
-                        status: "ok".into(),
-                        size: None,
-                        message: None,
-                    });
+        for chunk in items.chunks(opts.batch_size.max(1)) {
+            ensure_not_cancelled(state, opts.exec_id).await?;
+            let names: Vec<String> = chunk.iter().map(|(_, n)| n.clone()).collect();
+            match client
+                .fs_copy(&src_dir, &dst_dir, &names, opts.overwrite)
+                .await
+            {
+                Ok(_) => {
+                    copied += names.len();
+                    for (rel, _) in chunk {
+                        log.push_str(&format!("copied {rel}\n"));
+                        events.push(FileEvent {
+                            path: join_remote(dst_rel, rel),
+                            action: "copy".into(),
+                            status: "ok".into(),
+                            size: None,
+                            message: None,
+                        });
+                    }
+                }
+                Err(e) => {
+                    log.push_str(&format!("fs_copy fail {src_dir} -> {dst_dir}: {e}\n"));
+                    for (rel, _) in chunk {
+                        events.push(FileEvent {
+                            path: join_remote(dst_rel, rel),
+                            action: "copy".into(),
+                            status: "failed".into(),
+                            size: None,
+                            message: Some(e.to_string()),
+                        });
+                    }
                 }
             }
-            Err(e) => {
-                log.push_str(&format!("fs_copy fail {src_dir} -> {dst_dir}: {e}\n"));
-                for (rel, _) in items {
-                    events.push(FileEvent {
-                        path: join_remote(dst_rel, rel),
-                        action: "copy".into(),
-                        status: "failed".into(),
-                        size: None,
-                        message: Some(e.to_string()),
-                    });
-                }
+            if opts.request_interval_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(opts.request_interval_ms)).await;
             }
         }
     }
 
     let mut deleted = 0usize;
-    if delete_extras {
+    if opts.delete_extras {
+        ensure_not_cancelled(state, opts.exec_id).await?;
         deleted = remove_openlist_extras(&client, dst_rel, &src_set, log, events).await?;
     }
     Ok((copied, skipped, deleted))

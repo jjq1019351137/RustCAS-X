@@ -660,28 +660,31 @@ async fn cancel_execution(
     .await?
     .ok_or_else(|| AppError::bad_request("EXEC_NOT_FOUND", "执行记录不存在"))?;
 
-    let now = Utc::now().to_rfc3339();
     let msg = payload
         .message
         .unwrap_or_else(|| "cancelled by user".into());
     if row.2 == "running" || row.2 == "pending" {
+        // Mark cancelled; running sync loop polls this and stops cooperatively.
         sqlx::query(
             r#"
             UPDATE sync_executions
-            SET status='cancelled', message=?, finished_at=?
+            SET status='cancelled', message=?
             WHERE id=?
             "#,
         )
         .bind(&msg)
-        .bind(&now)
         .bind(execution_id)
         .execute(&state.db)
         .await?;
-        sqlx::query("UPDATE sync_tasks SET is_running=0, updated_at=? WHERE id=?")
-            .bind(&now)
-            .bind(sync_task_id)
-            .execute(&state.db)
-            .await?;
+        audit::write_user(
+            &state.db,
+            user.id,
+            "sync.cancel",
+            "sync_execution",
+            execution_id,
+            Some(&msg),
+        )
+        .await;
     }
     let refreshed = sqlx::query_as::<
         _,
