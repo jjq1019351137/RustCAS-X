@@ -1,8 +1,9 @@
 use crate::auth_ctx::{require_perm, CurrentUser};
 use crate::error::{AppError, AppResult};
 use crate::runtime::sync as sync_runtime;
+use crate::services::share_preview::{browse_drive, DriveBrowseIn};
 use crate::state::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -11,6 +12,7 @@ use futures_util::stream::{self, Stream};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -26,6 +28,48 @@ pub struct SyncCreateIn {
     strategy: Value,
     #[serde(default = "default_true")]
     enabled: bool,
+}
+
+#[derive(Deserialize, Default)]
+pub struct SyncUpdateIn {
+    name: Option<String>,
+    mode: Option<String>,
+    source: Option<Value>,
+    target: Option<Value>,
+    strategy: Option<Value>,
+    enabled: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+struct SyncImportIn {
+    #[serde(default)]
+    tasks: Vec<Value>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct LocalBrowseIn {
+    path: String,
+    max_items: Option<usize>,
+}
+
+#[derive(Deserialize, Default)]
+struct NetdiskBrowseIn {
+    dir_path: String,
+    account_name: Option<String>,
+    max_items: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+struct ExecFilesQuery {
+    offset: Option<i64>,
+    limit: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+struct CancelIn {
+    message: Option<String>,
 }
 
 fn one_way() -> String {
@@ -50,6 +94,7 @@ fn map_row(
 ) -> Value {
     json!({
         "id": id,
+        "uid": sync_task_uid,
         "sync_task_uid": sync_task_uid,
         "name": name,
         "enabled": enabled != 0,
@@ -58,9 +103,42 @@ fn map_row(
         "target": serde_json::from_str::<Value>(&target_json).unwrap_or(json!({})),
         "strategy": serde_json::from_str::<Value>(&strategy_json).unwrap_or(json!({"concurrency": 1})),
         "is_running": is_running != 0,
+        "drama_task_uids": [],
         "created_at": created_at,
         "updated_at": updated_at
     })
+}
+
+async fn fetch_one(state: &AppState, id: i64) -> AppResult<Value> {
+    let row = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            String,
+        ),
+    >(
+        r#"
+        SELECT id, sync_task_uid, name, enabled, mode,
+               source_json, target_json, strategy_json, is_running, created_at, updated_at
+        FROM sync_tasks WHERE id = ?
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::bad_request("SYNC_NOT_FOUND", "同步任务不存在"))?;
+    Ok(map_row(
+        row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10,
+    ))
 }
 
 async fn list_sync_tasks(State(state): State<AppState>, user: CurrentUser) -> AppResult<Json<Value>> {
@@ -98,6 +176,15 @@ async fn list_sync_tasks(State(state): State<AppState>, user: CurrentUser) -> Ap
     Ok(Json(json!(out)))
 }
 
+async fn get_sync_task(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(sync_task_id): Path<i64>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "sync:read")?;
+    Ok(Json(fetch_one(&state, sync_task_id).await?))
+}
+
 async fn create_sync_task(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -131,19 +218,157 @@ async fn create_sync_task(
     .fetch_one(&state.db)
     .await?;
 
-    Ok(Json(map_row(
-        id,
-        uid,
-        payload.name,
-        if payload.enabled { 1 } else { 0 },
-        payload.mode,
-        payload.source.to_string(),
-        payload.target.to_string(),
-        strategy.to_string(),
-        0,
-        now.clone(),
-        now,
-    )))
+    Ok(Json(fetch_one(&state, id).await?))
+}
+
+async fn patch_sync_task(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(sync_task_id): Path<i64>,
+    Json(payload): Json<SyncUpdateIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "sync:write")?;
+    let current = fetch_one(&state, sync_task_id).await?;
+    let name = payload
+        .name
+        .unwrap_or_else(|| current["name"].as_str().unwrap_or("").to_string());
+    let mode = payload
+        .mode
+        .unwrap_or_else(|| current["mode"].as_str().unwrap_or("one_way").to_string());
+    let source = payload
+        .source
+        .unwrap_or_else(|| current["source"].clone());
+    let target = payload
+        .target
+        .unwrap_or_else(|| current["target"].clone());
+    let strategy = payload
+        .strategy
+        .unwrap_or_else(|| current["strategy"].clone());
+    let enabled = payload
+        .enabled
+        .unwrap_or_else(|| current["enabled"].as_bool().unwrap_or(true));
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE sync_tasks SET
+            name=?, mode=?, source_json=?, target_json=?, strategy_json=?, enabled=?, updated_at=?
+        WHERE id=?
+        "#,
+    )
+    .bind(&name)
+    .bind(&mode)
+    .bind(source.to_string())
+    .bind(target.to_string())
+    .bind(strategy.to_string())
+    .bind(if enabled { 1 } else { 0 })
+    .bind(&now)
+    .bind(sync_task_id)
+    .execute(&state.db)
+    .await?;
+    Ok(Json(fetch_one(&state, sync_task_id).await?))
+}
+
+async fn delete_sync_task(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(sync_task_id): Path<i64>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "sync:write")?;
+    let n = sqlx::query("DELETE FROM sync_tasks WHERE id = ?")
+        .bind(sync_task_id)
+        .execute(&state.db)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        return Err(AppError::bad_request("SYNC_NOT_FOUND", "同步任务不存在"));
+    }
+    Ok(Json(json!({ "ok": true, "id": sync_task_id })))
+}
+
+async fn export_sync_tasks(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "sync:read")?;
+    let list = list_sync_tasks(State(state), user).await?.0;
+    Ok(Json(json!({
+        "version": 1,
+        "exported_at": Utc::now().to_rfc3339(),
+        "tasks": list
+    })))
+}
+
+async fn import_sync_tasks(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(payload): Json<SyncImportIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "sync:write")?;
+    let mode = payload.mode.unwrap_or_else(|| "skip".into());
+    let mut created = 0usize;
+    let mut updated = 0usize;
+    let mut skipped = 0usize;
+    let mut failed: Vec<Value> = Vec::new();
+    for item in payload.tasks {
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            failed.push(json!({ "name": name, "error": "empty name" }));
+            continue;
+        }
+        let existing: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM sync_tasks WHERE name = ? LIMIT 1")
+                .bind(&name)
+                .fetch_optional(&state.db)
+                .await?;
+        if let Some(id) = existing {
+            if mode == "skip" {
+                skipped += 1;
+                continue;
+            }
+            let patch = SyncUpdateIn {
+                name: Some(name.clone()),
+                mode: item.get("mode").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                source: item.get("source").cloned(),
+                target: item.get("target").cloned(),
+                strategy: item.get("strategy").cloned(),
+                enabled: item.get("enabled").and_then(|v| v.as_bool()),
+            };
+            match patch_sync_task(State(state.clone()), user.clone(), Path(id), Json(patch)).await {
+                Ok(_) => updated += 1,
+                Err(e) => failed.push(json!({ "name": name, "error": format!("{e:?}") })),
+            }
+        } else {
+            let create = SyncCreateIn {
+                name: name.clone(),
+                mode: item
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("one_way")
+                    .to_string(),
+                source: item.get("source").cloned().unwrap_or(json!({})),
+                target: item.get("target").cloned().unwrap_or(json!({})),
+                strategy: item.get("strategy").cloned().unwrap_or(json!({"concurrency": 1})),
+                enabled: item.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+            };
+            match create_sync_task(State(state.clone()), user.clone(), Json(create)).await {
+                Ok(_) => created += 1,
+                Err(e) => failed.push(json!({ "name": name, "error": format!("{e:?}") })),
+            }
+        }
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "failed": failed,
+        "total": created + updated + skipped + failed.len()
+    })))
 }
 
 async fn run_sync(
@@ -159,8 +384,9 @@ async fn run_sync(
         "id": exec_id,
         "sync_task_id": sync_task_id,
         "status": "success",
-        "message": "skeleton success",
-        "run_log": log
+        "message": "ok",
+        "run_log": log,
+        "stats": {}
     })))
 }
 
@@ -200,7 +426,9 @@ fn map_sync_execution(
         "message": message,
         "run_log": run_log,
         "started_at": started_at,
-        "finished_at": finished_at
+        "finished_at": finished_at,
+        "stats": {},
+        "stage": Value::Null
     })
 }
 
@@ -274,11 +502,210 @@ async fn latest_execution(
     }))
 }
 
+async fn execution_files(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((sync_task_id, execution_id)): Path<(i64, i64)>,
+    Query(q): Query<ExecFilesQuery>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "sync:read")?;
+    let exists: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM sync_executions WHERE sync_task_id=? AND id=?",
+    )
+    .bind(sync_task_id)
+    .bind(execution_id)
+    .fetch_optional(&state.db)
+    .await?;
+    if exists.is_none() {
+        return Err(AppError::bad_request("EXEC_NOT_FOUND", "执行记录不存在"));
+    }
+    // File-level ledger not ported yet; keep page shape for UI.
+    let offset = q.offset.unwrap_or(0).max(0);
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    Ok(Json(json!({
+        "items": [],
+        "total": 0,
+        "offset": offset,
+        "limit": limit
+    })))
+}
+
+async fn cancel_execution(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((sync_task_id, execution_id)): Path<(i64, i64)>,
+    Json(payload): Json<CancelIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "sync:run")?;
+    let row = sqlx::query_as::<
+        _,
+        (
+            i64,
+            i64,
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+        ),
+    >(
+        r#"
+        SELECT id, sync_task_id, status, message, run_log, started_at, finished_at
+        FROM sync_executions
+        WHERE sync_task_id=? AND id=?
+        "#,
+    )
+    .bind(sync_task_id)
+    .bind(execution_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::bad_request("EXEC_NOT_FOUND", "执行记录不存在"))?;
+
+    let now = Utc::now().to_rfc3339();
+    let msg = payload
+        .message
+        .unwrap_or_else(|| "cancelled by user".into());
+    if row.2 == "running" || row.2 == "pending" {
+        sqlx::query(
+            r#"
+            UPDATE sync_executions
+            SET status='cancelled', message=?, finished_at=?
+            WHERE id=?
+            "#,
+        )
+        .bind(&msg)
+        .bind(&now)
+        .bind(execution_id)
+        .execute(&state.db)
+        .await?;
+        sqlx::query("UPDATE sync_tasks SET is_running=0, updated_at=? WHERE id=?")
+            .bind(&now)
+            .bind(sync_task_id)
+            .execute(&state.db)
+            .await?;
+    }
+    let refreshed = sqlx::query_as::<
+        _,
+        (
+            i64,
+            i64,
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+        ),
+    >(
+        r#"
+        SELECT id, sync_task_id, status, message, run_log, started_at, finished_at
+        FROM sync_executions WHERE id=?
+        "#,
+    )
+    .bind(execution_id)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(Json(map_sync_execution(
+        refreshed.0,
+        refreshed.1,
+        refreshed.2,
+        refreshed.3,
+        refreshed.4,
+        refreshed.5,
+        refreshed.6,
+    )))
+}
+
+async fn browse_local(
+    user: CurrentUser,
+    Json(payload): Json<LocalBrowseIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "sync:read")?;
+    let raw = payload.path.trim();
+    let path = if raw.is_empty() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(raw)
+    };
+    if !path.exists() {
+        return Err(AppError::bad_request(
+            "LOCAL_PATH_NOT_FOUND",
+            format!("路径不存在: {}", path.display()),
+        ));
+    }
+    let max_items = payload.max_items.unwrap_or(500).clamp(1, 2000);
+    let mut items = Vec::new();
+    if path.is_dir() {
+        let rd = std::fs::read_dir(&path)
+            .map_err(|e| AppError::bad_request("LOCAL_BROWSE", e.to_string()))?;
+        for entry in rd.take(max_items) {
+            let entry =
+                entry.map_err(|e| AppError::bad_request("LOCAL_BROWSE", e.to_string()))?;
+            let meta = entry.metadata().ok();
+            let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let size = meta.as_ref().and_then(|m| {
+                if m.is_file() {
+                    Some(m.len() as i64)
+                } else {
+                    None
+                }
+            });
+            items.push(json!({
+                "name": entry.file_name().to_string_lossy(),
+                "path": entry.path().to_string_lossy(),
+                "is_dir": is_dir,
+                "size": size
+            }));
+        }
+    }
+    Ok(Json(json!({
+        "path": path.to_string_lossy(),
+        "items": items
+    })))
+}
+
+async fn browse_netdisk(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(payload): Json<NetdiskBrowseIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "sync:read")?;
+    let out = browse_drive(
+        &state.db,
+        DriveBrowseIn {
+            dir_path: payload.dir_path,
+            account_name: payload.account_name,
+            shareurl: None,
+            max_items: payload.max_items,
+        },
+    )
+    .await
+    .map_err(|e| AppError::bad_request("NETDISK_BROWSE", e.to_string()))?;
+    Ok(Json(out))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_sync_tasks).post(create_sync_task))
+        .route("/export", get(export_sync_tasks))
+        .route("/import", post(import_sync_tasks))
+        .route("/local/browse", post(browse_local))
+        .route("/netdisk/browse", post(browse_netdisk))
+        .route(
+            "/{sync_task_id}",
+            get(get_sync_task)
+                .patch(patch_sync_task)
+                .delete(delete_sync_task),
+        )
         .route("/{sync_task_id}/run", post(run_sync))
         .route("/{sync_task_id}/run/stream", post(run_sync_stream))
         .route("/{sync_task_id}/executions", get(list_executions))
         .route("/{sync_task_id}/executions/latest", get(latest_execution))
+        .route(
+            "/{sync_task_id}/executions/{execution_id}/files",
+            get(execution_files),
+        )
+        .route(
+            "/{sync_task_id}/executions/{execution_id}/cancel",
+            post(cancel_execution),
+        )
 }

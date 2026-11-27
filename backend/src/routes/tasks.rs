@@ -990,6 +990,40 @@ async fn run_all_tasks_stream(
     Ok(Sse::new(stream::iter(events.into_iter().map(Ok))).keep_alive(KeepAlive::default()))
 }
 
+#[derive(Deserialize)]
+struct TaskStatusIn {
+    enabled: bool,
+}
+
+async fn patch_task_status(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(task_id): Path<i64>,
+    Json(payload): Json<TaskStatusIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:write")?;
+    let n = sqlx::query("UPDATE tasks SET enabled=?, updated_at=? WHERE id=?")
+        .bind(if payload.enabled { 1 } else { 0 })
+        .bind(Utc::now().to_rfc3339())
+        .bind(task_id)
+        .execute(&state.db)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        return Err(AppError::bad_request("TASK_NOT_FOUND", "任务不存在"));
+    }
+    get_task(State(state), user, Path(task_id)).await
+}
+
+async fn savepath_snapshots_sync_stub(user: CurrentUser) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:write")?;
+    Ok(Json(json!({
+        "ok": true,
+        "synced": 0,
+        "note": "savepath snapshots not required for Quark-first wave"
+    })))
+}
+
 async fn repair_banned_stub(user: CurrentUser) -> AppResult<Json<Value>> {
     require_perm(&user, "task:write")?;
     Ok(Json(json!({
@@ -1000,21 +1034,107 @@ async fn repair_banned_stub(user: CurrentUser) -> AppResult<Json<Value>> {
     })))
 }
 
-async fn stop_completed_stub(user: CurrentUser) -> AppResult<Json<Value>> {
+async fn stop_completed_drama_tasks(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> AppResult<Json<Value>> {
     require_perm(&user, "task:write")?;
+    let rows = sqlx::query_as::<
+        _,
+        (i64, Option<i64>, Option<String>, String, Option<String>),
+    >(
+        r#"
+        SELECT id, tmdb_id, tmdb_media_type, extra_json, enddate
+        FROM tasks
+        WHERE enabled = 1 AND task_type = 'drama'
+        ORDER BY id DESC
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let checked = rows.len();
+    let today = chrono::Local::now().date_naive();
+    let tmdb_cfg = crate::services::tmdb::load_config(&state)
+        .await
+        .unwrap_or_default();
+    let client = crate::services::tmdb::TmdbClient::new(&tmdb_cfg);
+    let mut matched_ids = Vec::new();
+
+    for (id, tmdb_id, media_type, extra_json, enddate) in rows {
+        let extra: Value = serde_json::from_str(&extra_json).unwrap_or(json!({}));
+        if extra.get("ended").and_then(|v| v.as_bool()).unwrap_or(false) {
+            matched_ids.push(id);
+            continue;
+        }
+        if let Some(ed) = enddate.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if let Ok(end_d) =
+                chrono::NaiveDate::parse_from_str(&ed[..ed.len().min(10)], "%Y-%m-%d")
+            {
+                if today > end_d {
+                    matched_ids.push(id);
+                    continue;
+                }
+            }
+        }
+        if media_type.as_deref() == Some("tv") {
+            if let Some(tid) = tmdb_id.filter(|x| *x > 0) {
+                if client.is_configured() {
+                    if let Ok(Some(detail)) = client.get_tv_details(tid).await {
+                        let status = detail
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if status == "Ended" || status == "Canceled" {
+                            matched_ids.push(id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut stopped = 0usize;
+    let now = Utc::now().to_rfc3339();
+    for id in &matched_ids {
+        let extra_raw: String = sqlx::query_scalar(
+            "SELECT COALESCE(extra_json, '{}') FROM tasks WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or_else(|_| "{}".into());
+        let mut extra: Value = serde_json::from_str(&extra_raw).unwrap_or(json!({}));
+        if let Some(obj) = extra.as_object_mut() {
+            obj.insert("ended".into(), json!(true));
+        }
+        let n = sqlx::query(
+            "UPDATE tasks SET enabled=0, extra_json=?, updated_at=? WHERE id=? AND enabled=1",
+        )
+        .bind(extra.to_string())
+        .bind(&now)
+        .bind(id)
+        .execute(&state.db)
+        .await?
+        .rows_affected();
+        stopped += n as usize;
+    }
+
     Ok(Json(json!({
-        "checked": 0,
-        "matched": 0,
-        "stopped": 0,
-        "task_ids": []
+        "checked": checked,
+        "matched": matched_ids.len(),
+        "stopped": stopped,
+        "task_ids": matched_ids.into_iter().take(50).collect::<Vec<_>>()
     })))
 }
 
-async fn suggestions_stub(
-    user: CurrentUser,
-) -> AppResult<Json<Value>> {
+async fn suggestions_stub(user: CurrentUser) -> AppResult<Json<Value>> {
     require_perm(&user, "task:read")?;
     Ok(Json(json!({ "items": [], "note": "resource search not ported" })))
+}
+
+async fn suggestions_verify_stub(user: CurrentUser) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:read")?;
+    Ok(Json(json!({ "items": [], "note": "resource search verify not ported" })))
 }
 
 async fn post_share_preview(
@@ -1195,8 +1315,10 @@ pub fn router() -> Router<AppState> {
         .route("/run-all", post(run_all_tasks))
         .route("/run-all/stream", post(run_all_tasks_stream))
         .route("/repair-banned", post(repair_banned_stub))
-        .route("/drama/stop-completed", post(stop_completed_stub))
+        .route("/drama/stop-completed", post(stop_completed_drama_tasks))
+        .route("/drama/savepath-snapshots/sync", post(savepath_snapshots_sync_stub))
         .route("/suggestions", get(suggestions_stub))
+        .route("/suggestions/verify", post(suggestions_verify_stub))
         .route("/share/preview", post(post_share_preview))
         .route("/share/preview-batch", post(post_share_preview_batch))
         .route("/drive/browse", post(post_drive_browse))
@@ -1205,6 +1327,7 @@ pub fn router() -> Router<AppState> {
             "/{task_id}",
             get(get_task).patch(patch_task).delete(delete_task),
         )
+        .route("/{task_id}/status", axum::routing::patch(patch_task_status))
         .route("/{task_id}/run", post(run_task))
         .route("/{task_id}/run/stream", post(run_task_stream))
         .route("/{task_id}/executions", get(list_executions))
