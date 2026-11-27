@@ -1,4 +1,5 @@
 use crate::adapters::create_adapter;
+use crate::adapters::traits::CloudDriveAdapter;
 use crate::services::episode::{
     format_episode_anchor, is_before_start_episode, name_exists_in_dest, parse_episode_anchor,
     resolve_start_episode_key,
@@ -9,6 +10,7 @@ use crate::services::tmdb::{self, TmdbClient};
 use crate::settings_store::get_or_default;
 use crate::state::AppState;
 use chrono::Utc;
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -28,11 +30,14 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
             Option<String>,
             Option<i64>,
             Option<i64>,
+            Option<String>,
+            String,
         ),
     >(
         r#"
         SELECT taskname, shareurl, savepath, account_name, tmdb_media_type,
-               pattern, "replace", startfid, tmdb_id, ignore_extension
+               pattern, "replace", startfid, tmdb_id, ignore_extension,
+               update_subdir, extra_json
         FROM tasks WHERE id = ?
         "#,
     )
@@ -52,11 +57,20 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
         startfid,
         tmdb_id,
         ignore_extension,
+        update_subdir,
+        extra_json,
     ) = row;
     let pattern = pattern.unwrap_or_default();
     let replace = replace.unwrap_or_default();
     let startfid = startfid.unwrap_or_default();
+    let update_subdir = update_subdir.unwrap_or_default();
     let ignore_ext = ignore_extension.unwrap_or(0) != 0;
+    let extra: Value = serde_json::from_str(&extra_json).unwrap_or(json!({}));
+    let resave_mode = extra
+        .get("update_subdir_resave_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("none")
+        .to_string();
 
     #[derive(Deserialize, serde::Serialize, Default)]
     struct SaveRuleConfig {
@@ -530,8 +544,257 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
         .await;
     }
 
+    // Subdirectory sync (update_subdir)
+    if !update_subdir.trim().is_empty() {
+        let Ok(subdir_re) = Regex::new(&update_subdir) else {
+            log.push_str(&format!("update_subdir regex invalid: {update_subdir}\n"));
+            log.push_str(&format!("[{}] done\n", Utc::now().to_rfc3339()));
+            return finish(state, exec_id, "success", "transferred", &mut log).await;
+        };
+        let file_pat = if pattern.trim().is_empty() {
+            None
+        } else {
+            Regex::new(&pattern).ok()
+        };
+        log.push_str(&format!(
+            "subdir sync update_subdir={update_subdir} resave_mode={resave_mode}\n"
+        ));
+        // Refresh dest dir map
+        let dest_list2 = adapter.ls_dir(&dest_fid, 500).await.unwrap_or(json!({}));
+        let mut dest_dir_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for it in dest_list2
+            .pointer("/data/list")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let is_dir = it
+                .get("dir")
+                .or_else(|| it.get("is_dir"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !is_dir {
+                continue;
+            }
+            if let (Some(fid), Some(name)) = (item_fid(it), item_name(it)) {
+                dest_dir_map.insert(name, fid);
+            }
+        }
+        let mut sub_saved = 0usize;
+        for raw in &items {
+            let is_dir = raw
+                .get("dir")
+                .or_else(|| raw.get("is_dir"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !is_dir {
+                continue;
+            }
+            let Some(name) = item_name(raw) else { continue };
+            let Some(sfid) = item_fid(raw) else { continue };
+            if !subdir_re.is_match(&name) {
+                continue;
+            }
+            if resave_mode == "delete_then_resave" {
+                if let Some(old) = dest_dir_map.get(&name) {
+                    let _ = adapter.delete(&[old.clone()]).await;
+                    log.push_str(&format!("deleted dest subdir for resave: {name}\n"));
+                }
+            }
+            let child_path = join_path(&dest_path, &name);
+            let child_dest = ensure_dir_fid(adapter.as_ref(), &child_path, &mut log).await;
+            let Some(child_dest) = child_dest else {
+                log.push_str(&format!("subdir mkdir failed: {child_path}\n"));
+                continue;
+            };
+            match sync_share_dir(
+                adapter.as_ref(),
+                &pwd_id,
+                &stoken,
+                &sfid,
+                &child_dest,
+                &child_path,
+                file_pat.as_ref(),
+                Some(&subdir_re),
+                0,
+                &mut log,
+            )
+            .await
+            {
+                Ok(n) => {
+                    sub_saved += n;
+                    log.push_str(&format!("subdir synced {name} files={n}\n"));
+                }
+                Err(e) => log.push_str(&format!("subdir sync err {name}: {e}\n")),
+            }
+        }
+        log.push_str(&format!("subdir sync total_files={sub_saved}\n"));
+    }
+
     log.push_str(&format!("[{}] done\n", Utc::now().to_rfc3339()));
     finish(state, exec_id, "success", "transferred", &mut log).await
+}
+
+fn join_path(base: &str, name: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.is_empty() || base == "/" {
+        format!("/{name}")
+    } else {
+        format!("{base}/{name}")
+    }
+}
+
+async fn ensure_dir_fid(
+    adapter: &dyn CloudDriveAdapter,
+    path: &str,
+    log: &mut String,
+) -> Option<String> {
+    let mkdir_ret = adapter.mkdir(path).await.ok()?;
+    let mut fid = mkdir_ret
+        .pointer("/data/fid")
+        .map(|v| v.to_string().trim_matches('"').to_string())
+        .filter(|s| !s.is_empty());
+    if fid.is_none() {
+        let fids = adapter.get_fids(&[path.to_string()]).await.ok()?;
+        fid = fids
+            .first()
+            .and_then(|v| v.get("fid"))
+            .map(|v| v.to_string().trim_matches('"').to_string())
+            .filter(|s| !s.is_empty());
+    }
+    if fid.is_none() {
+        log.push_str(&format!("ensure_dir miss path={path} ret={mkdir_ret}\n"));
+    }
+    fid
+}
+
+async fn sync_share_dir(
+    adapter: &dyn CloudDriveAdapter,
+    pwd_id: &str,
+    stoken: &str,
+    share_dir_fid: &str,
+    dest_dir_fid: &str,
+    dest_abs_path: &str,
+    file_pattern: Option<&Regex>,
+    subdir_pattern: Option<&Regex>,
+    depth: usize,
+    log: &mut String,
+) -> anyhow::Result<usize> {
+    if depth > 3 {
+        return Ok(0);
+    }
+    let detail = adapter
+        .get_detail(pwd_id, stoken, share_dir_fid)
+        .await?;
+    let share_items = detail
+        .pointer("/data/list")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let dest_list = adapter.ls_dir(dest_dir_fid, 500).await.unwrap_or(json!({}));
+    let mut dest_names = Vec::new();
+    let mut dest_dir_map = std::collections::HashMap::new();
+    for it in dest_list
+        .pointer("/data/list")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let is_dir = it
+            .get("dir")
+            .or_else(|| it.get("is_dir"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let Some(name) = item_name(it) else { continue };
+        if is_dir {
+            if let Some(fid) = item_fid(it) {
+                dest_dir_map.insert(name, fid);
+            }
+        } else {
+            dest_names.push(name);
+        }
+    }
+
+    let mut transferred = 0usize;
+    let mut file_fids = Vec::new();
+    let mut file_tokens = Vec::new();
+
+    for raw in &share_items {
+        let is_dir = raw
+            .get("dir")
+            .or_else(|| raw.get("is_dir"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let Some(name) = item_name(raw) else { continue };
+        let Some(fid) = item_fid(raw) else { continue };
+        if is_dir {
+            if let Some(re) = subdir_pattern {
+                if !re.is_match(&name) {
+                    continue;
+                }
+            }
+            let child_dest = if let Some(existing) = dest_dir_map.get(&name) {
+                existing.clone()
+            } else {
+                let child_path = join_path(dest_abs_path, &name);
+                match ensure_dir_fid(adapter, &child_path, log).await {
+                    Some(f) => f,
+                    None => continue,
+                }
+            };
+            let child_path = join_path(dest_abs_path, &name);
+            transferred += Box::pin(sync_share_dir(
+                adapter,
+                pwd_id,
+                stoken,
+                &fid,
+                &child_dest,
+                &child_path,
+                file_pattern,
+                subdir_pattern,
+                depth + 1,
+                log,
+            ))
+            .await?;
+            continue;
+        }
+        if let Some(re) = file_pattern {
+            if !re.is_match(&name) {
+                continue;
+            }
+        }
+        if name_exists_in_dest(&name, &dest_names, false) {
+            continue;
+        }
+        let token = raw
+            .get("share_fid_token")
+            .or_else(|| raw.get("shareFidToken"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        file_fids.push(fid);
+        file_tokens.push(token);
+        log.push_str(&format!("subdir save: {dest_abs_path}/{name}\n"));
+    }
+
+    if !file_fids.is_empty() {
+        let save_ret = adapter
+            .save_file(&file_fids, &file_tokens, dest_dir_fid, pwd_id, stoken)
+            .await?;
+        if let Some(tid) = save_ret
+            .pointer("/data/task_id")
+            .or_else(|| save_ret.get("task_id"))
+            .map(|v| v.to_string().trim_matches('"').to_string())
+            .filter(|s| !s.is_empty())
+        {
+            if !tid.starts_with("quark_sync_") {
+                let _ = adapter.query_task(&tid).await;
+            }
+        }
+        transferred += file_fids.len();
+    }
+    Ok(transferred)
 }
 
 fn history_name_key(name: &str) -> String {
