@@ -29,7 +29,7 @@ base64 = "0.22"
 mime = "0.3"
 time = { version = "0.3", features = ["serde"] }
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies"] }
 url = "2"
 urlencoding = "2"
 futures-util = "0.3"

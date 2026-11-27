@@ -14,8 +14,8 @@
 | --- | --- | --- |
 | 0 | HTTP 壳、SQLite migrate、auth/setup/health、Docker/GHA | **done** |
 | 1 | users/roles/permissions、system save-rules、app_settings KV | **done** |
-| 2 | quark/cloud189 适配器 meta + `extract_url` + drive-accounts CRUD/probe 骨架 | **done（lsdir/转存待全量）** |
-| 3 | drama run/stream 骨架（解析分享链接 + execution 日志） | **done（转存/扫盘待全量）** |
+| 2 | quark/cloud189：`extract_url` + Quark `init/ls_dir/get_stoken/get_detail`；Cloud189 cookie init + share stoken + ls_dir | **done（转存/密码登录待全量）** |
+| 3 | drama run：账号 cookie → stoken → 分享列表 | **done（转存/TMDB 重命名待全量）** |
 | 4 | sync run/stream + deferred_sync_deletes 队列 | **done（文件同步待全量）** |
 | 5 | TMDB/OpenList settings；OpenList browse HTTP 客户端 | **done（TMDB API/缓存待全量）** |
 

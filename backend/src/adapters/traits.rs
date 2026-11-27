@@ -41,6 +41,19 @@ pub trait CloudDriveAdapter: Send + Sync {
         Ok(json!({ "status": 0, "message": "get_stoken pending full port" }))
     }
 
+    async fn get_detail(
+        &self,
+        _pwd_id: &str,
+        _stoken: &str,
+        _pdir_fid: &str,
+    ) -> anyhow::Result<Value> {
+        Ok(json!({
+            "code": -1,
+            "message": format!("{} get_detail pending", self.drive_type()),
+            "data": { "list": [] }
+        }))
+    }
+
     fn config(&self) -> &HashMap<String, Value>;
 }
 

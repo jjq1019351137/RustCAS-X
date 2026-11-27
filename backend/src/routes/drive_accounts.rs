@@ -394,16 +394,19 @@ async fn probe(
     let init = adapter.init().await.unwrap_or_else(|e| json!({ "ok": false, "message": e.to_string() }));
     let ok = init.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     let now = Utc::now().to_rfc3339();
+    let profile = if ok { Some(init.to_string()) } else { None };
     sqlx::query(
         r#"
         UPDATE drive_accounts
-        SET runtime_status=?, last_checked_at=?, last_error=?, probe_fail_count=CASE WHEN ? THEN 0 ELSE probe_fail_count+1 END, updated_at=?
+        SET runtime_status=?, last_checked_at=?, last_error=?, profile_json=COALESCE(?, profile_json),
+            probe_fail_count=CASE WHEN ? THEN 0 ELSE probe_fail_count+1 END, updated_at=?
         WHERE id=?
         "#,
     )
     .bind(if ok { "ok" } else { "error" })
     .bind(&now)
     .bind(init.get("message").and_then(|v| v.as_str()))
+    .bind(profile)
     .bind(ok)
     .bind(&now)
     .bind(account_id)
@@ -446,6 +449,46 @@ async fn lsdir_cache_status(_user: CurrentUser) -> AppResult<Json<Value>> {
     Ok(Json(json!({ "items": [] })))
 }
 
+#[derive(Deserialize)]
+struct LsDirIn {
+    #[serde(default = "root_fid")]
+    pdir_fid: String,
+    #[serde(default)]
+    max_items: i64,
+}
+fn root_fid() -> String {
+    "0".into()
+}
+
+async fn ls_dir(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(account_id): Path<i64>,
+    Json(payload): Json<LsDirIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "drive_account:read")?;
+    let row = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT drive_type, cookie, config_json FROM drive_accounts WHERE id = ?",
+    )
+    .bind(account_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::not_found("DRIVE_NOT_FOUND", "账号不存在"))?;
+    let config: Value = row
+        .2
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| json!({}));
+    let mut adapter = create_adapter(&row.0, Some(&config), Some(&row.1))
+        .map_err(|e| AppError::bad_request("ADAPTER", e.to_string()))?;
+    let _ = adapter.init().await;
+    let out = adapter
+        .ls_dir(&payload.pdir_fid, payload.max_items)
+        .await
+        .map_err(|e| AppError::api(axum::http::StatusCode::BAD_GATEWAY, "LSDIR", e.to_string()))?;
+    Ok(Json(out))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/types", get(list_types))
@@ -456,4 +499,5 @@ pub fn router() -> Router<AppState> {
         .route("/{account_id}/default", post(set_default))
         .route("/{account_id}/probe", post(probe))
         .route("/{account_id}/extract-url", post(extract_share))
+        .route("/{account_id}/lsdir", post(ls_dir))
 }
