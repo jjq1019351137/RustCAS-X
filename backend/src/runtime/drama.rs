@@ -242,6 +242,30 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
             .get("message")
             .and_then(|v| v.as_str())
             .unwrap_or("get_stoken failed");
+        log.push_str(&format!("share invalid, try auto-repair: {msg}\n"));
+        match crate::services::drama_repair::ban_and_try_repair(state, task_id, msg).await {
+            Ok(Some(item)) => {
+                let new_url = item
+                    .get("new_shareurl")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                log.push_str(&format!("auto-repaired -> {new_url}\n"));
+                return finish(
+                    state,
+                    exec_id,
+                    "failed",
+                    &format!("share banned; auto-switched backup: {new_url}"),
+                    &mut log,
+                )
+                .await;
+            }
+            Ok(None) => {
+                log.push_str("auto-repair: no usable backup\n");
+            }
+            Err(e) => {
+                log.push_str(&format!("auto-repair error: {e}\n"));
+            }
+        }
         return finish(state, exec_id, "failed", msg, &mut log).await;
     };
 

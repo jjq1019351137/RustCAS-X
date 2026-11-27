@@ -303,25 +303,43 @@ pub async fn preview_share_batch(
         if url.is_empty() || !seen.insert(url.clone()) {
             continue;
         }
+        if crate::services::share_cache::is_invalid(db, &url).await {
+            let item = json!({
+                "shareurl": url,
+                "drive_type": detect_drive_type(&url),
+                "ok": false,
+                "message": "known invalid shareurl"
+            });
+            items.push(item);
+            continue;
+        }
+        if let Some(cached) = crate::services::share_cache::cache_get(db, &url).await {
+            items.push(cached);
+            continue;
+        }
         let drive_type = detect_drive_type(&url);
         if drive_type != Some("quark") {
-            items.push(json!({
+            let item = json!({
                 "shareurl": url,
                 "drive_type": drive_type,
                 "ok": false,
                 "message": "仅支持夸克分享链接或无法识别"
-            }));
+            });
+            let _ = crate::services::share_cache::cache_set(db, &item, 24).await;
+            items.push(item);
             continue;
         }
-        match probe_one(db, &url, payload.account_name.as_deref()).await {
-            Ok(v) => items.push(v),
-            Err(e) => items.push(json!({
+        let item = match probe_one(db, &url, payload.account_name.as_deref()).await {
+            Ok(v) => v,
+            Err(e) => json!({
                 "shareurl": url,
                 "drive_type": "quark",
                 "ok": false,
                 "message": e.to_string()
-            })),
-        }
+            }),
+        };
+        let _ = crate::services::share_cache::cache_set(db, &item, 72).await;
+        items.push(item);
     }
     Ok(json!({ "items": items }))
 }

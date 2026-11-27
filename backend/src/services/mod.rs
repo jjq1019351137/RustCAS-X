@@ -6,6 +6,7 @@ pub mod notify;
 pub mod openlist;
 pub mod rename;
 pub mod resource_search;
+pub mod share_cache;
 pub mod share_links;
 pub mod share_preview;
 pub mod tmdb;

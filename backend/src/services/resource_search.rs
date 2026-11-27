@@ -426,6 +426,59 @@ async fn search_cloudsaver(
     Ok((vec![], new_token))
 }
 
+async fn search_net(
+    keyword: &str,
+    deep: i64,
+    drive_type: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
+    // Same endpoint as legacy CAS NetSearchProvider.
+    const BASE: &str = "https://pansearch.123cf.top";
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .build()?;
+    let resp = client
+        .get(format!("{BASE}/task_suggestions"))
+        .query(&[("q", keyword.to_lowercase()), ("d", deep.to_string())])
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Ok(vec![]);
+    }
+    let data: Value = resp.json().await.unwrap_or(Value::Null);
+    let arr = data
+        .get("data")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in arr {
+        let url = item
+            .get("shareurl")
+            .or_else(|| item.get("url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if url.is_empty() || !seen.insert(url.clone()) {
+            continue;
+        }
+        if drive_type == Some("quark") && detect_drive_type(&url) != Some("quark") {
+            continue;
+        }
+        out.push(json!({
+            "shareurl": url,
+            "taskname": item.get("taskname").or_else(|| item.get("title")).or_else(|| item.get("name")),
+            "content": item.get("content"),
+            "datetime": item.get("datetime"),
+            "channel": item.get("channel"),
+            "source": "Net",
+            "source_key": "net"
+        }));
+    }
+    Ok(out)
+}
+
 pub async fn fetch_suggestions(
     db: &SqlitePool,
     keyword: &str,
@@ -433,7 +486,6 @@ pub async fn fetch_suggestions(
     drive_type: Option<&str>,
     sources: Option<&[String]>,
 ) -> anyhow::Result<Value> {
-    let _ = deep;
     let keyword = keyword.trim();
     if keyword.is_empty() {
         return Ok(json!({ "success": true, "data": [], "message": "empty query" }));
@@ -453,6 +505,14 @@ pub async fn fetch_suggestions(
 
     let mut data = Vec::new();
     let mut messages = Vec::new();
+
+    let (net_on, _) = load_source(db, "net").await?;
+    if net_on && allow.as_ref().map(|a| a.contains("net")).unwrap_or(true) {
+        match search_net(keyword, deep, dt_filter).await {
+            Ok(items) => data.extend(items),
+            Err(e) => messages.push(format!("net: {e}")),
+        }
+    }
 
     let (pansou_on, pansou_cfg) = load_source(db, "pansou").await?;
     if pansou_on && allow.as_ref().map(|a| a.contains("pansou")).unwrap_or(true) {
@@ -508,25 +568,36 @@ pub async fn fetch_suggestions(
         }
     }
 
-    // de-dupe by shareurl keep first
+    // de-dupe + drop known invalid
     let mut seen = std::collections::HashSet::new();
-    data.retain(|it| {
+    let mut filtered = Vec::new();
+    let mut dropped_invalid = 0usize;
+    for it in data {
         let url = it
             .get("shareurl")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        !url.is_empty() && seen.insert(url)
-    });
+        if url.is_empty() || !seen.insert(url.clone()) {
+            continue;
+        }
+        if crate::services::share_cache::is_invalid(db, &url).await {
+            dropped_invalid += 1;
+            continue;
+        }
+        filtered.push(it);
+    }
+    if dropped_invalid > 0 {
+        messages.push(format!("已过滤失效链接：{dropped_invalid}"));
+    }
+    if messages.is_empty() {
+        messages.push(format!("已限定网盘类型：{}", dt_filter.unwrap_or("quark")));
+    }
 
     Ok(json!({
         "success": true,
-        "data": data,
-        "message": if messages.is_empty() {
-            Some(format!("已限定网盘类型：{}", dt_filter.unwrap_or("quark")))
-        } else {
-            Some(messages.join("; "))
-        }
+        "data": filtered,
+        "message": messages.join("; ")
     }))
 }
 

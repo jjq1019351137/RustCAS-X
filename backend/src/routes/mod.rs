@@ -1,4 +1,5 @@
 mod auth;
+mod cache;
 mod dashboard;
 mod drive_accounts;
 mod health;
@@ -39,6 +40,7 @@ pub fn api_router(state: AppState) -> Router {
         .nest("/notifications", notifications::router())
         .nest("/resource-search", resource_search::router())
         .nest("/media", media::router())
+        .nest("/cache", cache::router())
         .merge(stubs::router())
         .with_state(state)
 }
