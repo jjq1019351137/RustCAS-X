@@ -34,12 +34,13 @@ pnpm dev
 
 ## Docker
 
-镜像名：`DOCKERHUB_USERNAME/rustcas-x`
+默认推送 **GHCR**：`ghcr.io/jjq1019351137/rustcas-x`（无需额外 secrets）。  
+若仓库配置了 `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`，会额外推 Docker Hub；有阿里云 secrets 再推阿里云。
 
-GitHub Actions：`main` 推送触发 `Docker Publish`（与标签推送解耦，避免双跑）。
+GitHub Actions：仅 `main` 推送触发（打 `v*` 标签不单独跑第二遍；若提交已挂标签，镜像仍会带版本号）。
 
 ```bash
-docker run -d -p 5115:5115 -v rustcas-data:/app/backend/data YOURUSER/rustcas-x:latest
+docker run -d -p 5115:5115 -v rustcas-data:/app/backend/data ghcr.io/jjq1019351137/rustcas-x:latest
 ```
 
 打开 `http://localhost:5115` 完成首次管理员初始化。
