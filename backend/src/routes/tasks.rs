@@ -1029,9 +1029,58 @@ async fn repair_banned_tasks(
     user: CurrentUser,
 ) -> AppResult<Json<Value>> {
     require_perm(&user, "task:write")?;
-    let out = crate::services::drama_repair::repair_banned_tasks(&state)
+    let mut out = crate::services::drama_repair::repair_banned_tasks(&state)
         .await
         .map_err(|e| AppError::bad_request("REPAIR_BANNED", e.to_string()))?;
+
+    let repaired_ids: Vec<i64> = out
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|it| it.get("task_id").and_then(|v| v.as_i64()))
+        .collect();
+
+    let mut reran = 0usize;
+    let mut rerun_items = Vec::new();
+    for task_id in repaired_ids {
+        match drama::run_once(&state, task_id).await {
+            Ok((exec_id, _)) => {
+                reran += 1;
+                rerun_items.push(json!({
+                    "task_id": task_id,
+                    "exec_id": exec_id,
+                    "ok": true
+                }));
+            }
+            Err(e) => {
+                tracing::warn!(task_id, error = %e, "repair-banned re-run failed");
+                rerun_items.push(json!({
+                    "task_id": task_id,
+                    "ok": false,
+                    "error": e.to_string()
+                }));
+            }
+        }
+    }
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("reran".into(), json!(reran));
+        obj.insert("rerun_items".into(), json!(rerun_items));
+    }
+
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO audit_logs (actor_user_id, action, target_type, target_id, success, detail, created_at)
+        VALUES (?, 'task.repair_banned', 'task', '*', 1, ?, ?)
+        "#,
+    )
+    .bind(user.id)
+    .bind(out.to_string())
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(&state.db)
+    .await;
+
     Ok(Json(out))
 }
 

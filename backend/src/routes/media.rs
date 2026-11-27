@@ -160,6 +160,17 @@ async fn douban_list(
     let sub = q.sub_category.unwrap_or_default();
     let mut out = douban::list(&main, &sub, q.start.unwrap_or(0), q.limit.unwrap_or(20)).await;
     let cfg = tmdb::load_config(&state).await.unwrap_or_default();
+    let media_type = if main.starts_with("movie_") {
+        "movie"
+    } else {
+        "tv"
+    };
+    if cfg.configured() {
+        if let Some(items) = out.get_mut("items").and_then(|v| v.as_array_mut()) {
+            let client = TmdbClient::new(&cfg);
+            douban::enrich_tmdb(items, media_type, &client).await;
+        }
+    }
     if let Some(obj) = out.as_object_mut() {
         obj.insert("tmdb_configured".into(), json!(cfg.configured()));
         obj.insert("notice".into(), Value::Null);

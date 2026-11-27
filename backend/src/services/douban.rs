@@ -266,6 +266,96 @@ async fn fetch_ranking(
     }
 }
 
+/// Attach TMDB briefs by title/year for discover cards (best-effort).
+pub async fn enrich_tmdb(
+    items: &mut [Value],
+    media_type: &str,
+    client: &crate::services::tmdb::TmdbClient,
+) {
+    if !client.is_configured() || items.is_empty() {
+        return;
+    }
+    let mt = if media_type == "movie" { "movie" } else { "tv" };
+    for item in items.iter_mut() {
+        let title = item
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if title.is_empty() {
+            continue;
+        }
+        let year = item
+            .get("year")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let raw = if mt == "movie" {
+            client.search_movie(&title, year.as_deref(), 1).await
+        } else {
+            client.search_tv(&title, year.as_deref(), 1).await
+        };
+        let brief = raw.ok().flatten().and_then(|data| {
+            let results = data.get("results")?.as_array()?;
+            let best = pick_best_by_year(results, mt, year.as_deref())?;
+            Some(to_tmdb_brief(best, mt))
+        });
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert("tmdb".into(), brief.unwrap_or(Value::Null));
+        }
+    }
+}
+
+fn pick_best_by_year<'a>(results: &'a [Value], media_type: &str, year: Option<&str>) -> Option<&'a Value> {
+    if results.is_empty() {
+        return None;
+    }
+    let Some(y) = year.filter(|s| !s.is_empty()) else {
+        return results.first();
+    };
+    let date_key = if media_type == "movie" {
+        "release_date"
+    } else {
+        "first_air_date"
+    };
+    results
+        .iter()
+        .find(|item| {
+            item.get(date_key)
+                .and_then(|v| v.as_str())
+                .map(|d| d.starts_with(y))
+                .unwrap_or(false)
+        })
+        .or_else(|| results.first())
+}
+
+fn to_tmdb_brief(item: &Value, media_type: &str) -> Value {
+    if media_type == "movie" {
+        json!({
+            "id": item.get("id"),
+            "media_type": "movie",
+            "title": item.get("title"),
+            "original_title": item.get("original_title"),
+            "overview": item.get("overview"),
+            "poster_path": item.get("poster_path"),
+            "vote_average": item.get("vote_average"),
+            "release_date": item.get("release_date")
+        })
+    } else {
+        json!({
+            "id": item.get("id"),
+            "media_type": "tv",
+            "name": item.get("name"),
+            "original_name": item.get("original_name"),
+            "overview": item.get("overview"),
+            "poster_path": item.get("poster_path"),
+            "vote_average": item.get("vote_average"),
+            "first_air_date": item.get("first_air_date")
+        })
+    }
+}
+
 pub async fn list(
     main_category: &str,
     sub_category: &str,

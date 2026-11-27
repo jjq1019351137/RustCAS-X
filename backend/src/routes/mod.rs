@@ -1,3 +1,4 @@
+mod audit;
 mod auth;
 mod cache;
 mod dashboard;
@@ -7,6 +8,7 @@ mod magic_regex;
 mod media;
 mod notifications;
 mod openlist;
+mod plugins;
 mod resource_search;
 mod roles;
 mod setup;
@@ -41,6 +43,9 @@ pub fn api_router(state: AppState) -> Router {
         .nest("/resource-search", resource_search::router())
         .nest("/media", media::router())
         .nest("/cache", cache::router())
+        .nest("/audit-logs", audit::router())
+        .nest("/plugins", plugins::router())
+        .nest("/sync-plugins", plugins::sync_router())
         .merge(stubs::router())
         .with_state(state)
 }
