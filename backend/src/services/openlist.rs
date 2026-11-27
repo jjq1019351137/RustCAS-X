@@ -127,6 +127,20 @@ impl OpenListClient {
         .await
     }
 
+    pub async fn fs_remove(&self, dir: &str, names: &[String]) -> anyhow::Result<Value> {
+        if names.is_empty() {
+            return Ok(json!({ "code": 200 }));
+        }
+        self.post_json(
+            "/api/fs/remove",
+            json!({
+                "dir": normalize_abs(dir),
+                "names": names
+            }),
+        )
+        .await
+    }
+
     pub async fn ensure_dir(&self, path: &str) -> anyhow::Result<()> {
         let path = normalize_abs(path);
         if path == "/" {

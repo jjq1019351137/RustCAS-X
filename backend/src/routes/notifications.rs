@@ -24,7 +24,10 @@ fn default_config() -> Value {
         "channels": {
             "webhook": {
                 "enabled": false,
-                "url": ""
+                "url": "",
+                "method": "POST",
+                "headers": {},
+                "bearer_token": ""
             },
             "telegram": {
                 "enabled": false,
@@ -215,51 +218,36 @@ async fn test_notify(
     for ch in channels {
         match ch.as_str() {
             "webhook" => {
-                let url = setting
-                    .config
-                    .pointer("/channels/webhook/url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim();
                 let enabled = setting
                     .config
                     .pointer("/channels/webhook/enabled")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                if !enabled || url.is_empty() {
+                let ch = setting
+                    .config
+                    .pointer("/channels/webhook")
+                    .cloned()
+                    .unwrap_or(json!({}));
+                if !enabled {
                     results.push(json!({
                         "channel": "webhook",
                         "ok": false,
-                        "error": "webhook 未启用或 URL 为空"
+                        "error": "webhook 未启用"
                     }));
                     continue;
                 }
-                let body = json!({
-                    "title": payload.title,
-                    "content": payload.content,
-                    "source": "rustcas-x-test"
-                });
-                let resp = reqwest::Client::new()
-                    .post(url)
-                    .json(&body)
-                    .timeout(std::time::Duration::from_secs(10))
-                    .send()
-                    .await;
-                match resp {
-                    Ok(r) if r.status().is_success() => {
-                        results.push(json!({ "channel": "webhook", "ok": true, "error": null }))
-                    }
-                    Ok(r) => results.push(json!({
-                        "channel": "webhook",
-                        "ok": false,
-                        "error": format!("HTTP {}", r.status())
-                    })),
-                    Err(e) => results.push(json!({
-                        "channel": "webhook",
-                        "ok": false,
-                        "error": e.to_string()
-                    })),
-                }
+                let (ok, error) = crate::services::notify::send_webhook_channel(
+                    &ch,
+                    &payload.title,
+                    &payload.content,
+                    "rustcas-x-test",
+                )
+                .await;
+                results.push(json!({
+                    "channel": "webhook",
+                    "ok": ok,
+                    "error": error
+                }));
             }
             "telegram" => {
                 let enabled = setting

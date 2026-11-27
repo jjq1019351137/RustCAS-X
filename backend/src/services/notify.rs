@@ -21,17 +21,76 @@ fn channel_enabled(cfg: &Value, key: &str) -> bool {
             .unwrap_or(false)
 }
 
-async fn send_webhook(url: &str, title: &str, content: &str) -> bool {
-    let body = json!({ "title": title, "content": content, "source": "rustcas-x" });
-    match reqwest::Client::new()
-        .post(url)
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
+/// Send webhook with optional method / headers / bearer from channel config.
+pub async fn send_webhook_channel(
+    channel: &Value,
+    title: &str,
+    content: &str,
+    source: &str,
+) -> (bool, Option<String>) {
+    let url = channel
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if url.is_empty() {
+        return (false, Some("webhook URL 为空".into()));
+    }
+    let method = channel
+        .get("method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("POST")
+        .trim()
+        .to_ascii_uppercase();
+    let body = json!({
+        "title": title,
+        "content": content,
+        "source": source
+    });
+    let client = reqwest::Client::new();
+    let mut req = match method.as_str() {
+        "GET" => client.get(url),
+        "PUT" => client.put(url).json(&body),
+        "PATCH" => client.patch(url).json(&body),
+        _ => client.post(url).json(&body),
+    };
+    req = req.timeout(std::time::Duration::from_secs(10));
+
+    if let Some(headers) = channel.get("headers").and_then(|v| v.as_object()) {
+        for (k, v) in headers {
+            if let Some(val) = v.as_str() {
+                req = req.header(k.as_str(), val);
+            }
+        }
+    }
+    if let Some(auth) = channel
+        .get("authorization")
+        .or_else(|| channel.get("Authorization"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
     {
-        Ok(r) => r.status().is_success(),
-        Err(_) => false,
+        req = req.header("Authorization", auth);
+    } else if let Some(token) = channel
+        .get("bearer_token")
+        .or_else(|| channel.get("token"))
+        .or_else(|| channel.get("secret"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let value = if token.to_ascii_lowercase().starts_with("bearer ") {
+            token.to_string()
+        } else {
+            format!("Bearer {token}")
+        };
+        req = req.header("Authorization", value);
+    }
+
+    match req.send().await {
+        Ok(r) if r.status().is_success() => (true, None),
+        Ok(r) => (false, Some(format!("HTTP {}", r.status()))),
+        Err(e) => (false, Some(e.to_string())),
     }
 }
 
@@ -117,14 +176,9 @@ pub async fn send_runtime(state: &AppState, title: &str, content: &str) {
     }
 
     if channel_enabled(cfg, "webhook") {
-        if let Some(url) = cfg
-            .pointer("/channels/webhook/url")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-        {
-            let ok = send_webhook(url, title, content).await;
-            tracing::debug!(ok, "notify webhook");
+        if let Some(ch) = cfg.pointer("/channels/webhook") {
+            let (ok, err) = send_webhook_channel(ch, title, content, "rustcas-x").await;
+            tracing::debug!(ok, ?err, "notify webhook");
         }
     }
     if channel_enabled(cfg, "telegram") {

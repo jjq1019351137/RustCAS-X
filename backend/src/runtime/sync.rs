@@ -39,15 +39,19 @@ async fn flush_file_events(state: &AppState, exec_id: i64, events: &[FileEvent])
 }
 
 pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i64, String)> {
-    let row = sqlx::query_as::<_, (String, String, String, String, String)>(
-        "SELECT sync_task_uid, name, mode, source_json, target_json FROM sync_tasks WHERE id = ?",
+    let row = sqlx::query_as::<_, (String, String, String, String, String, String)>(
+        r#"
+        SELECT sync_task_uid, name, mode, source_json, target_json,
+               COALESCE(strategy_json, '{}')
+        FROM sync_tasks WHERE id = ?
+        "#,
     )
     .bind(sync_task_id)
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| anyhow::anyhow!("sync task not found"))?;
 
-    let (uid, name, mode, source_json, target_json) = row;
+    let (uid, name, mode, source_json, target_json, strategy_json) = row;
     sqlx::query("UPDATE sync_tasks SET is_running = 1, updated_at = ? WHERE id = ?")
         .bind(Utc::now().to_rfc3339())
         .bind(sync_task_id)
@@ -78,15 +82,30 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
 
     let source: Value = serde_json::from_str(&source_json).unwrap_or_default();
     let target: Value = serde_json::from_str(&target_json).unwrap_or_default();
+    let strategy: Value = serde_json::from_str(&strategy_json).unwrap_or_default();
     let src_type = source.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let dst_type = target.get("type").and_then(|v| v.as_str()).unwrap_or("");
     log.push_str(&format!("plan: {src_type} -> {dst_type}\n"));
 
-    let overwrite = target
+    let overwrite = strategy
         .get("overwrite")
+        .or_else(|| target.get("overwrite"))
         .or_else(|| source.get("overwrite"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let delete_extras = strategy
+        .get("one_way_delete_extras")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let delete_delay_secs = strategy
+        .get("one_way_delete_extras_delay_minutes")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(5)
+        .max(0)
+        * 60;
+    log.push_str(&format!(
+        "strategy overwrite={overwrite} delete_extras={delete_extras} delay_secs={delete_delay_secs}\n"
+    ));
 
     let result_status;
     let result_msg;
@@ -94,11 +113,24 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
         ("local", "local") => {
             let src_rel = source.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let dst_rel = target.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            match sync_local_to_local(state, src_rel, dst_rel, overwrite, &mut log, &mut file_events)
+            match sync_local_to_local(
+                state,
+                &uid,
+                src_rel,
+                dst_rel,
+                overwrite,
+                delete_extras,
+                delete_delay_secs,
+                &mut log,
+                &mut file_events,
+            )
+            .await
             {
-                Ok((copied, skipped, dirs)) => {
+                Ok((copied, skipped, dirs, deleted)) => {
                     result_status = "success";
-                    result_msg = format!("local→local copied={copied} skipped={skipped} dirs={dirs}");
+                    result_msg = format!(
+                        "local→local copied={copied} skipped={skipped} dirs={dirs} deleted={deleted}"
+                    );
                     log.push_str(&format!("{result_msg}\n"));
                 }
                 Err(e) => {
@@ -116,14 +148,17 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
                 src_rel,
                 dst_rel,
                 overwrite,
+                delete_extras,
                 &mut log,
                 &mut file_events,
             )
             .await
             {
-                Ok((copied, skipped)) => {
+                Ok((copied, skipped, deleted)) => {
                     result_status = "success";
-                    result_msg = format!("local→openlist uploaded={copied} skipped={skipped}");
+                    result_msg = format!(
+                        "local→openlist uploaded={copied} skipped={skipped} deleted={deleted}"
+                    );
                     log.push_str(&format!("{result_msg}\n"));
                 }
                 Err(e) => {
@@ -138,17 +173,22 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
             let dst_rel = target.get("path").and_then(|v| v.as_str()).unwrap_or("");
             match sync_openlist_to_local(
                 state,
+                &uid,
                 src_rel,
                 dst_rel,
                 overwrite,
+                delete_extras,
+                delete_delay_secs,
                 &mut log,
                 &mut file_events,
             )
             .await
             {
-                Ok((copied, skipped)) => {
+                Ok((copied, skipped, deleted)) => {
                     result_status = "success";
-                    result_msg = format!("openlist→local downloaded={copied} skipped={skipped}");
+                    result_msg = format!(
+                        "openlist→local downloaded={copied} skipped={skipped} deleted={deleted}"
+                    );
                     log.push_str(&format!("{result_msg}\n"));
                 }
                 Err(e) => {
@@ -166,14 +206,17 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
                 src_rel,
                 dst_rel,
                 overwrite,
+                delete_extras,
                 &mut log,
                 &mut file_events,
             )
             .await
             {
-                Ok((copied, skipped)) => {
+                Ok((copied, skipped, deleted)) => {
                     result_status = "success";
-                    result_msg = format!("openlist→openlist copied={copied} skipped={skipped}");
+                    result_msg = format!(
+                        "openlist→openlist copied={copied} skipped={skipped} deleted={deleted}"
+                    );
                     log.push_str(&format!("{result_msg}\n"));
                 }
                 Err(e) => {
@@ -271,14 +314,17 @@ fn normalize_components(path: &Path) -> PathBuf {
     out
 }
 
-fn sync_local_to_local(
+async fn sync_local_to_local(
     state: &AppState,
+    sync_uid: &str,
     src_rel: &str,
     dst_rel: &str,
     overwrite: bool,
+    delete_extras: bool,
+    delete_delay_secs: i64,
     log: &mut String,
     events: &mut Vec<FileEvent>,
-) -> anyhow::Result<(usize, usize, usize)> {
+) -> anyhow::Result<(usize, usize, usize, usize)> {
     let root = sync_root(state);
     fs::create_dir_all(&root)?;
     let src = resolve_under(&root, src_rel)?;
@@ -319,7 +365,7 @@ fn sync_local_to_local(
                 (0, 1)
             }
         };
-        return Ok((c, s, 0));
+        return Ok((c, s, 0, 0));
     }
     if !src.is_dir() {
         anyhow::bail!("source is neither file nor directory");
@@ -340,7 +386,53 @@ fn sync_local_to_local(
         log,
         events,
     )?;
-    Ok((copied, skipped, dirs))
+
+    let mut deleted = 0usize;
+    if delete_extras {
+        let src_files = collect_local_files(&src)?;
+        let src_set: std::collections::HashSet<String> =
+            src_files.into_iter().map(|(rel, _, _)| rel).collect();
+        let dst_files = collect_local_files(&dst)?;
+        for (rel, size, _) in dst_files {
+            if src_set.contains(&rel) {
+                continue;
+            }
+            match deferred_delete::enqueue(
+                state,
+                Some(sync_uid),
+                &dst.to_string_lossy(),
+                &rel,
+                delete_delay_secs,
+            )
+            .await
+            {
+                Ok(id) => {
+                    deleted += 1;
+                    log.push_str(&format!(
+                        "enqueue delete extra {rel} (id={id} delay={delete_delay_secs}s)\n"
+                    ));
+                    events.push(FileEvent {
+                        path: dst.join(&rel).display().to_string(),
+                        action: "delete".into(),
+                        status: "queued".into(),
+                        size: Some(size as i64),
+                        message: Some(format!("deferred id={id}")),
+                    });
+                }
+                Err(e) => {
+                    log.push_str(&format!("enqueue delete fail {rel}: {e}\n"));
+                    events.push(FileEvent {
+                        path: dst.join(&rel).display().to_string(),
+                        action: "delete".into(),
+                        status: "failed".into(),
+                        size: Some(size as i64),
+                        message: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+    }
+    Ok((copied, skipped, dirs, deleted))
 }
 
 enum CopyOutcome {
@@ -484,9 +576,10 @@ async fn sync_local_to_openlist(
     src_rel: &str,
     dst_rel: &str,
     overwrite: bool,
+    delete_extras: bool,
     log: &mut String,
     events: &mut Vec<FileEvent>,
-) -> anyhow::Result<(usize, usize)> {
+) -> anyhow::Result<(usize, usize, usize)> {
     let client = openlist_client(state).await?;
     let root = sync_root(state);
     fs::create_dir_all(&root)?;
@@ -502,20 +595,23 @@ async fn sync_local_to_openlist(
     client.ensure_dir(dst_rel).await?;
     let files = collect_local_files(&src)?;
     let remote_files = client.walk_files(dst_rel).await.unwrap_or_default();
-    let remote_map: std::collections::HashMap<String, u64> = remote_files.into_iter().collect();
+    let remote_map: std::collections::HashMap<String, u64> =
+        remote_files.iter().cloned().collect();
+    let src_set: std::collections::HashSet<String> =
+        files.iter().map(|(rel, _, _)| rel.clone()).collect();
 
     let mut copied = 0usize;
     let mut skipped = 0usize;
-    for (rel, size, local) in files {
-        let remote = join_remote(dst_rel, &rel);
-        if let Some(rs) = remote_map.get(&rel) {
-            if (*rs == size || !overwrite) && !overwrite {
+    for (rel, size, local) in &files {
+        let remote = join_remote(dst_rel, rel);
+        if let Some(rs) = remote_map.get(rel) {
+            if !overwrite || *rs == *size {
                 skipped += 1;
                 events.push(FileEvent {
                     path: remote.clone(),
                     action: "upload".into(),
                     status: "skipped".into(),
-                    size: Some(size as i64),
+                    size: Some(*size as i64),
                     message: None,
                 });
                 continue;
@@ -527,28 +623,36 @@ async fn sync_local_to_openlist(
                 let _ = client.ensure_dir(&parent_s).await;
             }
         }
-        client.put_file(&remote, &local).await?;
+        client.put_file(&remote, local).await?;
         copied += 1;
         log.push_str(&format!("uploaded {rel}\n"));
         events.push(FileEvent {
             path: remote,
             action: "upload".into(),
             status: "ok".into(),
-            size: Some(size as i64),
+            size: Some(*size as i64),
             message: None,
         });
     }
-    Ok((copied, skipped))
+
+    let mut deleted = 0usize;
+    if delete_extras {
+        deleted = remove_openlist_extras(&client, dst_rel, &src_set, log, events).await?;
+    }
+    Ok((copied, skipped, deleted))
 }
 
 async fn sync_openlist_to_local(
     state: &AppState,
+    sync_uid: &str,
     src_rel: &str,
     dst_rel: &str,
     overwrite: bool,
+    delete_extras: bool,
+    delete_delay_secs: i64,
     log: &mut String,
     events: &mut Vec<FileEvent>,
-) -> anyhow::Result<(usize, usize)> {
+) -> anyhow::Result<(usize, usize, usize)> {
     let client = openlist_client(state).await?;
     let root = sync_root(state);
     fs::create_dir_all(&root)?;
@@ -559,9 +663,11 @@ async fn sync_openlist_to_local(
         dst.display()
     ));
     let files = client.walk_files(src_rel).await?;
+    let src_set: std::collections::HashSet<String> =
+        files.iter().map(|(rel, _)| rel.clone()).collect();
     let mut copied = 0usize;
     let mut skipped = 0usize;
-    for (rel, size) in files {
+    for (rel, size) in &files {
         let local = {
             let mut p = dst.to_path_buf();
             for part in rel.split('/') {
@@ -571,19 +677,21 @@ async fn sync_openlist_to_local(
             }
             p
         };
-        if local.exists() && !overwrite {
+        if local.exists() {
             let ls = fs::metadata(&local)?.len();
-            skipped += 1;
-            events.push(FileEvent {
-                path: local.display().to_string(),
-                action: "download".into(),
-                status: "skipped".into(),
-                size: Some(if ls == size { size as i64 } else { size as i64 }),
-                message: None,
-            });
-            continue;
+            if !overwrite || ls == *size {
+                skipped += 1;
+                events.push(FileEvent {
+                    path: local.display().to_string(),
+                    action: "download".into(),
+                    status: "skipped".into(),
+                    size: Some(*size as i64),
+                    message: None,
+                });
+                continue;
+            }
         }
-        let remote = join_remote(src_rel, &rel);
+        let remote = join_remote(src_rel, rel);
         client.download_to_file(&remote, &local).await?;
         copied += 1;
         log.push_str(&format!("downloaded {rel}\n"));
@@ -591,11 +699,47 @@ async fn sync_openlist_to_local(
             path: local.display().to_string(),
             action: "download".into(),
             status: "ok".into(),
-            size: Some(size as i64),
+            size: Some(*size as i64),
             message: None,
         });
     }
-    Ok((copied, skipped))
+
+    let mut deleted = 0usize;
+    if delete_extras {
+        let dst_files = collect_local_files(&dst)?;
+        for (rel, size, _) in dst_files {
+            if src_set.contains(&rel) {
+                continue;
+            }
+            match deferred_delete::enqueue(
+                state,
+                Some(sync_uid),
+                &dst.to_string_lossy(),
+                &rel,
+                delete_delay_secs,
+            )
+            .await
+            {
+                Ok(id) => {
+                    deleted += 1;
+                    log.push_str(&format!(
+                        "enqueue delete extra {rel} (id={id} delay={delete_delay_secs}s)\n"
+                    ));
+                    events.push(FileEvent {
+                        path: dst.join(&rel).display().to_string(),
+                        action: "delete".into(),
+                        status: "queued".into(),
+                        size: Some(size as i64),
+                        message: Some(format!("deferred id={id}")),
+                    });
+                }
+                Err(e) => {
+                    log.push_str(&format!("enqueue delete fail {rel}: {e}\n"));
+                }
+            }
+        }
+    }
+    Ok((copied, skipped, deleted))
 }
 
 async fn sync_openlist_to_openlist(
@@ -603,14 +747,16 @@ async fn sync_openlist_to_openlist(
     src_rel: &str,
     dst_rel: &str,
     overwrite: bool,
+    delete_extras: bool,
     log: &mut String,
     events: &mut Vec<FileEvent>,
-) -> anyhow::Result<(usize, usize)> {
+) -> anyhow::Result<(usize, usize, usize)> {
     let client = openlist_client(state).await?;
     log.push_str(&format!("openlist→openlist src={src_rel} dst={dst_rel}\n"));
     client.ensure_dir(dst_rel).await?;
     let files = client.walk_files(src_rel).await?;
-    let total = files.len();
+    let src_set: std::collections::HashSet<String> =
+        files.iter().map(|(rel, _)| rel.clone()).collect();
     let remote_dst = client.walk_files(dst_rel).await.unwrap_or_default();
     let dst_map: std::collections::HashMap<String, u64> = remote_dst.into_iter().collect();
 
@@ -619,19 +765,8 @@ async fn sync_openlist_to_openlist(
     let mut skipped = 0usize;
     for (rel, size) in files {
         let remote = join_remote(dst_rel, &rel);
-        if dst_map.contains_key(&rel) && !overwrite {
-            skipped += 1;
-            events.push(FileEvent {
-                path: remote,
-                action: "copy".into(),
-                status: "skipped".into(),
-                size: Some(size as i64),
-                message: None,
-            });
-            continue;
-        }
         if let Some(rs) = dst_map.get(&rel) {
-            if *rs == size && !overwrite {
+            if !overwrite || *rs == size {
                 skipped += 1;
                 events.push(FileEvent {
                     path: remote,
@@ -698,5 +833,75 @@ async fn sync_openlist_to_openlist(
             }
         }
     }
-    Ok((copied, total.saturating_sub(copied).max(skipped)))
+
+    let mut deleted = 0usize;
+    if delete_extras {
+        deleted = remove_openlist_extras(&client, dst_rel, &src_set, log, events).await?;
+    }
+    Ok((copied, skipped, deleted))
+}
+
+async fn remove_openlist_extras(
+    client: &OpenListClient,
+    dst_rel: &str,
+    src_set: &std::collections::HashSet<String>,
+    log: &mut String,
+    events: &mut Vec<FileEvent>,
+) -> anyhow::Result<usize> {
+    let remote_dst = client.walk_files(dst_rel).await.unwrap_or_default();
+    let mut by_dir: std::collections::HashMap<String, Vec<(String, String, u64)>> =
+        std::collections::HashMap::new();
+    for (rel, size) in remote_dst {
+        if src_set.contains(&rel) {
+            continue;
+        }
+        let name = Path::new(&rel)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&rel)
+            .to_string();
+        let parent = Path::new(&rel)
+            .parent()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .filter(|p| !p.is_empty())
+            .unwrap_or_default();
+        by_dir.entry(parent).or_default().push((rel, name, size));
+    }
+    let mut deleted = 0usize;
+    for (parent, items) in by_dir {
+        let dir = if parent.is_empty() {
+            openlist::normalize_abs(dst_rel)
+        } else {
+            join_remote(dst_rel, &parent)
+        };
+        let names: Vec<String> = items.iter().map(|(_, n, _)| n.clone()).collect();
+        match client.fs_remove(&dir, &names).await {
+            Ok(_) => {
+                for (rel, _, size) in items {
+                    deleted += 1;
+                    log.push_str(&format!("deleted extra {rel}\n"));
+                    events.push(FileEvent {
+                        path: join_remote(dst_rel, &rel),
+                        action: "delete".into(),
+                        status: "ok".into(),
+                        size: Some(size as i64),
+                        message: None,
+                    });
+                }
+            }
+            Err(e) => {
+                log.push_str(&format!("fs_remove fail {dir}: {e}\n"));
+                for (rel, _, size) in items {
+                    events.push(FileEvent {
+                        path: join_remote(dst_rel, &rel),
+                        action: "delete".into(),
+                        status: "failed".into(),
+                        size: Some(size as i64),
+                        message: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+    }
+    Ok(deleted)
 }

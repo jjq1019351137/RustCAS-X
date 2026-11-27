@@ -22,6 +22,7 @@
 | 7 | 豆瓣发现页 + proxy-image 缓存 | **done** |
 | 8 | 审计列表/写入、插件空注册表、网盘探针调度 | **done** |
 | 9 | 同步/设置类写操作审计补齐 | **done** |
+| 10 | Sync `one_way_delete_extras` + webhook 头 + 回归清单 | **done** |
 
 ## Quark-first 约定
 
@@ -29,12 +30,13 @@
 - **放弃**：天翼深度登录验证码、dl302 / strm 全量、插件运行时执行
 - **可空操作**：savepath snapshots、lsdir-cache refresh（返回稳定 shape）
 
+联调清单见 [`REGRESSION.md`](./REGRESSION.md)。
+
 ## 下一步优先
 
-1. Docker 镜像联调 / 前端回归清单（追剧、修链、豆瓣、探针）
-2. Sync 文件级 walk/copy 与延时删除行为对照
-3. 通知渠道边角（webhook 鉴权头等）
-4. 插件运行时（若需要再开波次）
+1. 按 `REGRESSION.md` 做 Docker 实机联调
+2. Sync 并发 / OpenList 批量拷贝边角
+3. 插件运行时（若需要再开波次）
 
 ## 兼容约定
 
