@@ -224,6 +224,15 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
         .execute(&state.db)
         .await?;
 
+    if result_status == "success" || result_status == "failed" {
+        crate::services::notify::send_runtime(
+            state,
+            &format!("同步任务{result_status}"),
+            &format!("任务: {name}\n执行ID: {exec_id}\n结果: {result_msg}"),
+        )
+        .await;
+    }
+
     Ok((exec_id, log))
 }
 

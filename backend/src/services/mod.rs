@@ -2,6 +2,7 @@ pub mod drama_repair;
 pub mod drive_util;
 pub mod episode;
 pub mod magic_rename;
+pub mod notify;
 pub mod openlist;
 pub mod rename;
 pub mod resource_search;

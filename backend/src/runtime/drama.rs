@@ -957,5 +957,26 @@ async fn finish(
     .bind(exec_id)
     .execute(&state.db)
     .await?;
+
+    if status == "success" || status == "failed" {
+        let taskname: String = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(t.taskname, '')
+            FROM task_executions e
+            JOIN tasks t ON t.id = e.task_id
+            WHERE e.id = ?
+            "#,
+        )
+        .bind(exec_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+        let title = format!("追剧任务{status}");
+        let content = format!("任务: {taskname}\n执行ID: {exec_id}\n结果: {message}");
+        crate::services::notify::send_runtime(state, &title, &content).await;
+    }
+
     Ok((exec_id, log.clone()))
 }

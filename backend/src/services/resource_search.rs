@@ -221,27 +221,17 @@ async fn search_pansou(
     Ok(out)
 }
 
-async fn search_cloudsaver(server: &str, token: &str, keyword: &str) -> anyhow::Result<Vec<Value>> {
-    let server = server.trim().trim_end_matches('/');
-    if server.is_empty() || token.trim().is_empty() {
-        return Ok(vec![]);
-    }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(45))
-        .build()?;
-    let resp = client
-        .get(format!("{server}/api/search"))
-        .header("Authorization", format!("Bearer {token}"))
-        .query(&[("keyword", keyword)])
-        .send()
-        .await;
-    let Ok(resp) = resp else {
-        return Ok(vec![]);
-    };
-    if !resp.status().is_success() {
-        return Ok(vec![]);
-    }
-    let data: Value = resp.json().await.unwrap_or(Value::Null);
+fn strip_html(text: &str) -> String {
+    let t = text
+        .replace("<mark class=\"highlight\">", "")
+        .replace("</mark>", "");
+    Regex::new(r"<[^>]+>")
+        .ok()
+        .map(|re| re.replace_all(&t, "").to_string())
+        .unwrap_or(t)
+}
+
+fn parse_cloudsaver_data(data: &Value, keyword: &str) -> Vec<Value> {
     let arr = data
         .get("data")
         .and_then(|v| v.as_array())
@@ -250,11 +240,81 @@ async fn search_cloudsaver(server: &str, token: &str, keyword: &str) -> anyhow::
         .unwrap_or_default();
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for item in arr {
-        let url = item
+    let kw = keyword.trim().to_lowercase();
+
+    for ch in arr {
+        // CloudSaver returns channels with nested list + cloudLinks
+        if let Some(list) = ch.get("list").and_then(|v| v.as_array()) {
+            let channel = ch
+                .get("channel")
+                .or_else(|| ch.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            for item in list {
+                let title = strip_html(item.get("title").and_then(|v| v.as_str()).unwrap_or(""));
+                if !kw.is_empty() {
+                    let norm: String = title.chars().filter(|c| !c.is_whitespace()).collect();
+                    let norm = norm.to_lowercase();
+                    let tokens: Vec<&str> = kw.split_whitespace().filter(|t| !t.is_empty()).collect();
+                    if !tokens.is_empty()
+                        && !tokens.iter().all(|t| {
+                            let tt: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+                            norm.contains(&tt.to_lowercase())
+                        })
+                    {
+                        continue;
+                    }
+                }
+                let desc = strip_html(
+                    item.get("desc")
+                        .or_else(|| item.get("content"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                );
+                let tm = item
+                    .get("datetime")
+                    .or_else(|| item.get("time"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let links = item
+                    .get("cloudLinks")
+                    .or_else(|| item.get("cloud_links"))
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                for cl in links {
+                    let url = cl
+                        .get("url")
+                        .or_else(|| cl.get("link"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if url.is_empty() || !seen.insert(url.clone()) {
+                        continue;
+                    }
+                    if detect_drive_type(&url) != Some("quark") {
+                        continue;
+                    }
+                    out.push(json!({
+                        "shareurl": url,
+                        "taskname": title,
+                        "content": desc,
+                        "datetime": tm,
+                        "channel": channel,
+                        "source": "CloudSaver",
+                        "source_key": "cloudsaver"
+                    }));
+                }
+            }
+            continue;
+        }
+
+        // flat fallback
+        let url = ch
             .get("shareurl")
-            .or_else(|| item.get("url"))
-            .or_else(|| item.get("link"))
+            .or_else(|| ch.get("url"))
+            .or_else(|| ch.get("link"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim()
@@ -267,15 +327,103 @@ async fn search_cloudsaver(server: &str, token: &str, keyword: &str) -> anyhow::
         }
         out.push(json!({
             "shareurl": url,
-            "taskname": item.get("title").or_else(|| item.get("taskname")).or_else(|| item.get("name")),
-            "content": item.get("content"),
-            "datetime": item.get("datetime"),
-            "channel": item.get("channel"),
+            "taskname": ch.get("title").or_else(|| ch.get("taskname")).or_else(|| ch.get("name")),
+            "content": ch.get("content"),
+            "datetime": ch.get("datetime"),
+            "channel": ch.get("channel"),
             "source": "CloudSaver",
             "source_key": "cloudsaver"
         }));
     }
-    Ok(out)
+    out
+}
+
+async fn cloudsaver_login(
+    client: &reqwest::Client,
+    server: &str,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<Option<String>> {
+    if username.trim().is_empty() || password.is_empty() {
+        return Ok(None);
+    }
+    let resp = client
+        .post(format!("{server}/api/user/login"))
+        .json(&json!({ "username": username, "password": password }))
+        .send()
+        .await?;
+    let data: Value = resp.json().await.unwrap_or(Value::Null);
+    if data.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+        Ok(data
+            .pointer("/data/token")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn cloudsaver_search_once(
+    client: &reqwest::Client,
+    server: &str,
+    token: &str,
+    keyword: &str,
+) -> anyhow::Result<(bool, Value)> {
+    let resp = client
+        .get(format!("{server}/api/search"))
+        .header("Authorization", format!("Bearer {token}"))
+        .query(&[("keyword", keyword), ("lastMessageId", "")])
+        .send()
+        .await?;
+    let data: Value = resp.json().await.unwrap_or(Value::Null);
+    let ok = data.get("success").and_then(|v| v.as_bool()).unwrap_or(false)
+        || data.get("data").is_some();
+    Ok((ok, data))
+}
+
+/// Returns (items, optional refreshed token to persist).
+async fn search_cloudsaver(
+    server: &str,
+    token: &str,
+    username: &str,
+    password: &str,
+    keyword: &str,
+) -> anyhow::Result<(Vec<Value>, Option<String>)> {
+    let server = server.trim().trim_end_matches('/');
+    if server.is_empty() {
+        return Ok((vec![], None));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .build()?;
+
+    let mut token = token.trim().to_string();
+    let mut new_token: Option<String> = None;
+
+    if token.is_empty() {
+        if let Some(t) = cloudsaver_login(&client, server, username, password).await? {
+            token = t.clone();
+            new_token = Some(t);
+        } else {
+            return Ok((vec![], None));
+        }
+    }
+
+    let (ok, data) = cloudsaver_search_once(&client, server, &token, keyword).await?;
+    if ok {
+        return Ok((parse_cloudsaver_data(&data, keyword), new_token));
+    }
+
+    // token expired → re-login
+    if let Some(t) = cloudsaver_login(&client, server, username, password).await? {
+        token = t.clone();
+        new_token = Some(t);
+        let (ok2, data2) = cloudsaver_search_once(&client, server, &token, keyword).await?;
+        if ok2 {
+            return Ok((parse_cloudsaver_data(&data2, keyword), new_token));
+        }
+    }
+    Ok((vec![], new_token))
 }
 
 pub async fn fetch_suggestions(
@@ -318,12 +466,44 @@ pub async fn fetch_suggestions(
         }
     }
 
-    let (cs_on, cs_cfg) = load_source(db, "cloudsaver").await?;
+    let (cs_on, mut cs_cfg) = load_source(db, "cloudsaver").await?;
     if cs_on && allow.as_ref().map(|a| a.contains("cloudsaver")).unwrap_or(true) {
-        let server = cs_cfg.get("server").and_then(|v| v.as_str()).unwrap_or("");
-        let token = cs_cfg.get("token").and_then(|v| v.as_str()).unwrap_or("");
-        match search_cloudsaver(server, token, keyword).await {
-            Ok(items) => data.extend(items),
+        let server = cs_cfg
+            .get("server")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let token = cs_cfg
+            .get("token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let username = cs_cfg
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let password = cs_cfg
+            .get("password")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        match search_cloudsaver(&server, &token, &username, &password, keyword).await {
+            Ok((items, new_token)) => {
+                data.extend(items);
+                if let Some(t) = new_token {
+                    if let Some(obj) = cs_cfg.as_object_mut() {
+                        obj.insert("token".into(), json!(t));
+                    }
+                    let _ = sqlx::query(
+                        "UPDATE resource_search_sources SET config_json=?, updated_at=? WHERE key='cloudsaver'",
+                    )
+                    .bind(cs_cfg.to_string())
+                    .bind(Utc::now().to_rfc3339())
+                    .execute(db)
+                    .await;
+                }
+            }
             Err(e) => messages.push(format!("cloudsaver: {e}")),
         }
     }

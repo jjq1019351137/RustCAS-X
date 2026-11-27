@@ -3,6 +3,7 @@ mod dashboard;
 mod drive_accounts;
 mod health;
 mod magic_regex;
+mod media;
 mod notifications;
 mod openlist;
 mod resource_search;
@@ -37,6 +38,7 @@ pub fn api_router(state: AppState) -> Router {
         .nest("/openlist", openlist::router())
         .nest("/notifications", notifications::router())
         .nest("/resource-search", resource_search::router())
+        .nest("/media", media::router())
         .merge(stubs::router())
         .with_state(state)
 }
