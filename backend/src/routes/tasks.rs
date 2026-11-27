@@ -1,6 +1,11 @@
 use crate::auth_ctx::{require_perm, CurrentUser};
 use crate::error::{AppError, AppResult};
 use crate::runtime::drama;
+use crate::services::share_links::{self, load_share_links, mark_checked, save_share_links, set_from_urls};
+use crate::services::share_preview::{
+    browse_drive, preview_share, preview_share_batch, DriveBrowseIn, SharePreviewBatchIn,
+    SharePreviewIn,
+};
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -39,6 +44,8 @@ pub struct TaskCreateIn {
     extra: Value,
     #[serde(default)]
     addition: Value,
+    #[serde(default)]
+    shareurls: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -60,6 +67,17 @@ pub struct TaskUpdateIn {
     enabled: Option<bool>,
     extra: Option<Value>,
     addition: Option<Value>,
+    shareurls: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Default)]
+struct ShareUrlsCheckIn {
+    shareurls: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct ShareUrlActivateIn {
+    shareurl: String,
 }
 
 fn drama_type() -> String {
@@ -91,6 +109,7 @@ struct TaskRow {
     ignore_extension: Option<i64>,
     addition_json: String,
     extra_json: String,
+    shareurl_list_json: String,
     created_at: String,
     updated_at: String,
 }
@@ -114,6 +133,7 @@ fn map_task_full(r: TaskRow) -> Value {
         r.enddate.as_deref(),
         r.shareurl_ban.as_deref(),
     );
+    let shareurls = load_share_links(&r.shareurl_list_json, r.shareurl.as_deref());
     json!({
         "id": r.id,
         "task_uid": r.task_uid,
@@ -136,7 +156,7 @@ fn map_task_full(r: TaskRow) -> Value {
         "tmdb_episode_weekdays": episode_weekdays,
         "tmdb_update_weekdays": update_weekdays,
         "sync_task_uids": [],
-        "shareurls": [],
+        "shareurls": shareurls,
         "addition": addition,
         "extra": extra,
         "created_at": r.created_at,
@@ -148,7 +168,9 @@ const TASK_SELECT: &str = r#"
 SELECT id, task_uid, task_type, taskname, shareurl, savepath, enabled,
        tmdb_id, tmdb_media_type, account_name, pattern, "replace", startfid,
        update_subdir, enddate, shareurl_ban, ignore_extension,
-       addition_json, extra_json, created_at, updated_at
+       addition_json, extra_json,
+       COALESCE(shareurl_list_json, '[]') AS shareurl_list_json,
+       created_at, updated_at
 FROM tasks
 "#;
 
@@ -232,6 +254,43 @@ fn compute_would_run_today(
     runweek.contains(&today)
 }
 
+async fn attach_recent_executions(state: &AppState, tasks: &mut [Value]) -> AppResult<()> {
+    for task in tasks.iter_mut() {
+        let Some(id) = task.get("id").and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        let rows = sqlx::query_as::<
+            _,
+            (
+                i64,
+                i64,
+                String,
+                Option<String>,
+                Option<String>,
+                String,
+                String,
+                Option<String>,
+            ),
+        >(
+            r#"
+            SELECT id, task_id, status, stage, message, run_log, started_at, finished_at
+            FROM task_executions
+            WHERE task_id = ?
+            ORDER BY id DESC
+            LIMIT 5
+            "#,
+        )
+        .bind(id)
+        .fetch_all(&state.db)
+        .await?;
+        task["executions"] = json!(rows
+            .into_iter()
+            .map(|r| map_execution(r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7))
+            .collect::<Vec<_>>());
+    }
+    Ok(())
+}
+
 async fn list_tasks(State(state): State<AppState>, user: CurrentUser) -> AppResult<Json<Value>> {
     require_perm(&user, "task:read")?;
     let rows = sqlx::query_as::<_, TaskRow>(&format!(
@@ -239,7 +298,9 @@ async fn list_tasks(State(state): State<AppState>, user: CurrentUser) -> AppResu
     ))
     .fetch_all(&state.db)
     .await?;
-    Ok(Json(json!(rows.into_iter().map(map_task_full).collect::<Vec<_>>())))
+    let mut tasks: Vec<Value> = rows.into_iter().map(map_task_full).collect();
+    attach_recent_executions(&state, &mut tasks).await?;
+    Ok(Json(json!(tasks)))
 }
 
 async fn get_task(
@@ -264,14 +325,19 @@ async fn create_task(
     require_perm(&user, "task:write")?;
     let uid = format!("task_{}", Uuid::new_v4().simple());
     let now = Utc::now().to_rfc3339();
+    let active = payload.shareurl.clone().unwrap_or_default();
+    let share_list = match &payload.shareurls {
+        Some(urls) => set_from_urls(urls, &active),
+        None => set_from_urls(&[], &active),
+    };
     let id = sqlx::query_scalar::<_, i64>(
         r#"
         INSERT INTO tasks
             (task_uid, task_type, taskname, shareurl, savepath, account_name,
              pattern, "replace", startfid, update_subdir, enddate, shareurl_ban,
              tmdb_id, tmdb_media_type, ignore_extension, enabled,
-             addition_json, extra_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             addition_json, extra_json, shareurl_list_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING id
         "#,
     )
@@ -293,6 +359,7 @@ async fn create_task(
     .bind(if payload.enabled { 1 } else { 0 })
     .bind(payload.addition.to_string())
     .bind(payload.extra.to_string())
+    .bind(&share_list)
     .bind(&now)
     .bind(&now)
     .fetch_one(&state.db)
@@ -362,6 +429,17 @@ async fn patch_task(
         .unwrap_or_else(|| mapped["addition"].clone());
     let extra = payload.extra.unwrap_or_else(|| mapped["extra"].clone());
     let now = Utc::now().to_rfc3339();
+    let active = shareurl.clone().unwrap_or_default();
+    let share_list = if let Some(urls) = payload.shareurls {
+        set_from_urls(&urls, &active)
+    } else {
+        let existing_links = mapped
+            .get("shareurls")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        save_share_links(&existing_links, &active)
+    };
 
     sqlx::query(
         r#"
@@ -370,7 +448,7 @@ async fn patch_task(
             pattern=?, "replace"=?, startfid=?, update_subdir=?,
             enddate=?, shareurl_ban=?,
             tmdb_id=?, tmdb_media_type=?, ignore_extension=?, enabled=?,
-            addition_json=?, extra_json=?, updated_at=?
+            addition_json=?, extra_json=?, shareurl_list_json=?, updated_at=?
         WHERE id=?
         "#,
     )
@@ -390,6 +468,7 @@ async fn patch_task(
     .bind(if enabled { 1 } else { 0 })
     .bind(addition.to_string())
     .bind(extra.to_string())
+    .bind(&share_list)
     .bind(&now)
     .bind(task_id)
     .execute(&state.db)
@@ -585,9 +664,178 @@ async fn latest_execution(
     }))
 }
 
+async fn post_share_preview(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(payload): Json<SharePreviewIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:read")?;
+    let out = preview_share(&state, payload)
+        .await
+        .map_err(|e| AppError::bad_request("SHARE_PREVIEW", e.to_string()))?;
+    Ok(Json(out))
+}
+
+async fn post_share_preview_batch(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(payload): Json<SharePreviewBatchIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:read")?;
+    let out = preview_share_batch(&state.db, payload)
+        .await
+        .map_err(|e| AppError::bad_request("SHARE_PREVIEW_BATCH", e.to_string()))?;
+    Ok(Json(out))
+}
+
+async fn post_drive_browse(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(payload): Json<DriveBrowseIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:read")?;
+    let out = browse_drive(&state.db, payload)
+        .await
+        .map_err(|e| AppError::bad_request("DRIVE_BROWSE", e.to_string()))?;
+    Ok(Json(out))
+}
+
+async fn post_drive_mkdir(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(payload): Json<DriveBrowseIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:write")?;
+    let drive_type = payload
+        .shareurl
+        .as_deref()
+        .and_then(crate::services::drive_util::detect_drive_type)
+        .unwrap_or("quark");
+    if drive_type != "quark" {
+        return Err(AppError::bad_request(
+            "DRIVE_MKDIR",
+            "RustCAS-X 当前仅支持夸克 mkdir",
+        ));
+    }
+    let (account_name, adapter) =
+        crate::services::drive_util::load_adapter(&state.db, drive_type, payload.account_name.as_deref())
+            .await
+            .map_err(|e| AppError::bad_request("DRIVE_ACCOUNT_NOT_FOUND", e.to_string()))?;
+    let dir_path = payload.dir_path.trim();
+    let resp = adapter
+        .mkdir(dir_path)
+        .await
+        .map_err(|e| AppError::bad_request("DRIVE_MKDIR", e.to_string()))?;
+    Ok(Json(json!({
+        "account_name": account_name,
+        "dir_path": dir_path,
+        "response": resp
+    })))
+}
+
+async fn check_task_shareurls(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(task_id): Path<i64>,
+    Json(payload): Json<ShareUrlsCheckIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:read")?;
+    let row = sqlx::query_as::<_, TaskRow>(&format!("{TASK_SELECT} WHERE id = ?"))
+        .bind(task_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::bad_request("TASK_NOT_FOUND", "任务不存在"))?;
+    let mut links = load_share_links(&row.shareurl_list_json, row.shareurl.as_deref());
+    let urls: Vec<String> = if let Some(list) = payload.shareurls.filter(|v| !v.is_empty()) {
+        list
+    } else {
+        links
+            .iter()
+            .filter_map(|x| x.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .collect()
+    };
+    let batch = preview_share_batch(
+        &state.db,
+        SharePreviewBatchIn {
+            shareurls: urls.clone(),
+            account_name: row.account_name.clone(),
+        },
+    )
+    .await
+    .map_err(|e| AppError::bad_request("SHAREURLS_CHECK", e.to_string()))?;
+    let batch_items = batch
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out_items = Vec::new();
+    for it in &batch_items {
+        let url = it.get("shareurl").and_then(|v| v.as_str()).unwrap_or("");
+        let ok = it.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        let message = it.get("message").and_then(|v| v.as_str());
+        mark_checked(&mut links, url, ok, message);
+        out_items.push(json!({
+            "url": url,
+            "ok": ok,
+            "message": message,
+            "status": if ok { "ok" } else { "invalid" },
+            "latest_video": it.get("latest_video").cloned().unwrap_or(Value::Null)
+        }));
+    }
+    let active = row.shareurl.clone().unwrap_or_default();
+    let saved = save_share_links(&links, &active);
+    sqlx::query("UPDATE tasks SET shareurl_list_json=?, updated_at=? WHERE id=?")
+        .bind(&saved)
+        .bind(Utc::now().to_rfc3339())
+        .bind(task_id)
+        .execute(&state.db)
+        .await?;
+    Ok(Json(json!({ "items": out_items })))
+}
+
+async fn activate_task_shareurl(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(task_id): Path<i64>,
+    Json(payload): Json<ShareUrlActivateIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:write")?;
+    let row = sqlx::query_as::<_, TaskRow>(&format!("{TASK_SELECT} WHERE id = ?"))
+        .bind(task_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::bad_request("TASK_NOT_FOUND", "任务不存在"))?;
+    let url = payload.shareurl.trim().to_string();
+    if url.is_empty() {
+        return Err(AppError::bad_request("SHAREURL_EMPTY", "分享链接为空"));
+    }
+    let mut links = load_share_links(&row.shareurl_list_json, row.shareurl.as_deref());
+    if !links
+        .iter()
+        .any(|x| x.get("url").and_then(|v| v.as_str()) == Some(url.as_str()))
+    {
+        links.push(share_links::new_link(&url, "manual"));
+    }
+    let saved = save_share_links(&links, &url);
+    sqlx::query(
+        "UPDATE tasks SET shareurl=?, shareurl_ban=NULL, shareurl_list_json=?, updated_at=? WHERE id=?",
+    )
+    .bind(&url)
+    .bind(&saved)
+    .bind(Utc::now().to_rfc3339())
+    .bind(task_id)
+    .execute(&state.db)
+    .await?;
+    get_task(State(state), user, Path(task_id)).await
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_tasks).post(create_task))
+        .route("/share/preview", post(post_share_preview))
+        .route("/share/preview-batch", post(post_share_preview_batch))
+        .route("/drive/browse", post(post_drive_browse))
+        .route("/drive/mkdir", post(post_drive_mkdir))
         .route(
             "/{task_id}",
             get(get_task).patch(patch_task).delete(delete_task),
@@ -597,4 +845,6 @@ pub fn router() -> Router<AppState> {
         .route("/{task_id}/executions", get(list_executions))
         .route("/{task_id}/executions/latest", get(latest_execution))
         .route("/{task_id}/executions/{exec_id}", get(get_execution))
+        .route("/{task_id}/shareurls/check", post(check_task_shareurls))
+        .route("/{task_id}/shareurls/activate", post(activate_task_shareurl))
 }
