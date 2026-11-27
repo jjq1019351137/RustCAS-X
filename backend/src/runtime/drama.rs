@@ -5,9 +5,12 @@ use crate::services::episode::{
 };
 use crate::services::rename::{matches_pattern, rename_preview};
 use crate::services::tmdb::{self, TmdbClient};
+use crate::settings_store::get_or_default;
 use crate::state::AppState;
 use chrono::Utc;
+use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 /// Drama run: init → extract → stoken → detail → filter → mkdir → save → query_task.
 pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, String)> {
@@ -53,6 +56,26 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
     let replace = replace.unwrap_or_default();
     let startfid = startfid.unwrap_or_default();
     let ignore_ext = ignore_extension.unwrap_or(0) != 0;
+
+    #[derive(Deserialize, serde::Serialize, Default)]
+    struct SaveRuleConfig {
+        #[serde(default)]
+        enable_skip_transferred_history: bool,
+    }
+    let save_rules: SaveRuleConfig = get_or_default(&state.db, "save_rules")
+        .await
+        .unwrap_or_default();
+    let skip_history = save_rules.enable_skip_transferred_history;
+    let history_raw: String = sqlx::query_scalar(
+        "SELECT COALESCE(transferred_history_json, '[]') FROM tasks WHERE id = ?",
+    )
+    .bind(task_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "[]".into());
+    let history_set = build_history_name_set(&history_raw);
 
     let exec_id = sqlx::query_scalar::<_, i64>(
         r#"
@@ -268,7 +291,8 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
 
     let mut fid_list = Vec::new();
     let mut token_list = Vec::new();
-    let mut rename_plan: Vec<(String, String)> = Vec::new(); // origin -> target
+    let mut rename_plan: Vec<(String, String)> = Vec::new(); // origin -> target (diff only)
+    let mut saved_pairs: Vec<(String, String)> = Vec::new(); // all saved origin/target
     let mut skipped_pattern = 0usize;
     let mut skipped_start = 0usize;
     let mut skipped_exist = 0usize;
@@ -315,6 +339,12 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
             continue;
         }
 
+        if skip_history && is_history_hit(&history_set, &name, &renamed) {
+            skipped_exist += 1;
+            log.push_str(&format!("跳过历史已转存: {name} -> {renamed}\n"));
+            continue;
+        }
+
         let token = item
             .get("share_fid_token")
             .or_else(|| item.get("shareFidToken"))
@@ -329,6 +359,7 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
         log.push_str(&format!("save candidate: {name} -> {renamed} ({fid})\n"));
         fid_list.push(fid);
         token_list.push(token);
+        saved_pairs.push((name.clone(), renamed.clone()));
         if renamed != name {
             rename_plan.push((name, renamed));
         }
@@ -426,8 +457,62 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
         ));
     }
 
+    if !saved_pairs.is_empty() {
+        let mut entries: Vec<Value> =
+            serde_json::from_str(&history_raw).unwrap_or_else(|_| vec![]);
+        for (origin, target) in &saved_pairs {
+            entries.push(json!({
+                "origin": origin,
+                "target": target,
+                "at": Utc::now().to_rfc3339()
+            }));
+        }
+        if entries.len() > 500 {
+            entries = entries.split_off(entries.len() - 500);
+        }
+        let _ = sqlx::query(
+            "UPDATE tasks SET transferred_history_json = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(Value::Array(entries).to_string())
+        .bind(Utc::now().to_rfc3339())
+        .bind(task_id)
+        .execute(&state.db)
+        .await;
+    }
+
     log.push_str(&format!("[{}] done\n", Utc::now().to_rfc3339()));
     finish(state, exec_id, "success", "transferred", &mut log).await
+}
+
+fn history_name_key(name: &str) -> String {
+    let stem = name
+        .rsplit_once('.')
+        .filter(|(_, ext)| !ext.is_empty() && ext.len() <= 8 && !ext.contains(['/', '\\']))
+        .map(|(s, _)| s)
+        .unwrap_or(name);
+    stem.trim().to_lowercase()
+}
+
+fn build_history_name_set(raw: &str) -> HashSet<String> {
+    let mut set = HashSet::new();
+    let arr: Vec<Value> = serde_json::from_str(raw).unwrap_or_default();
+    for item in arr {
+        for key in ["origin", "target", "file_name", "file_name_re"] {
+            if let Some(s) = item.get(key).and_then(|v| v.as_str()) {
+                let k = history_name_key(s);
+                if !k.is_empty() {
+                    set.insert(k);
+                }
+            }
+        }
+    }
+    set
+}
+
+fn is_history_hit(set: &HashSet<String>, origin: &str, target: &str) -> bool {
+    let o = history_name_key(origin);
+    let t = history_name_key(target);
+    (!o.is_empty() && set.contains(&o)) || (!t.is_empty() && set.contains(&t))
 }
 
 fn item_fid(item: &Value) -> Option<String> {

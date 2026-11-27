@@ -84,10 +84,11 @@ async fn run_tick(state: &AppState) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let last: Option<String> =
-        sqlx::query_scalar("SELECT value_json FROM settings WHERE key = 'scheduler_last_tick'")
-            .fetch_optional(&state.db)
-            .await?;
+    let last: Option<String> = sqlx::query_scalar(
+        "SELECT value_json FROM app_settings WHERE key = 'scheduler_last_tick'",
+    )
+    .fetch_optional(&state.db)
+    .await?;
     let interval = cfg.interval_minutes.max(1);
     if let Some(raw) = last.as_deref() {
         let ts = raw.trim().trim_matches('"');

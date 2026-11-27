@@ -120,6 +120,44 @@ impl TmdbClient {
     pub async fn get_movie_details(&self, movie_id: i64) -> anyhow::Result<Option<Value>> {
         self.get(&format!("/movie/{movie_id}"), &[]).await
     }
+
+    pub async fn search_tv(&self, query: &str, year: Option<&str>, page: u32) -> anyhow::Result<Option<Value>> {
+        let mut extra = vec![
+            ("query", query.to_string()),
+            ("page", page.max(1).to_string()),
+        ];
+        if let Some(y) = year.filter(|s| !s.is_empty()) {
+            extra.push(("first_air_date_year", y.to_string()));
+        }
+        self.get("/search/tv", &extra).await
+    }
+
+    pub async fn search_movie(
+        &self,
+        query: &str,
+        year: Option<&str>,
+        page: u32,
+    ) -> anyhow::Result<Option<Value>> {
+        let mut extra = vec![
+            ("query", query.to_string()),
+            ("page", page.max(1).to_string()),
+        ];
+        if let Some(y) = year.filter(|s| !s.is_empty()) {
+            extra.push(("year", y.to_string()));
+        }
+        self.get("/search/movie", &extra).await
+    }
+
+    pub async fn search_multi(&self, query: &str, page: u32) -> anyhow::Result<Option<Value>> {
+        self.get(
+            "/search/multi",
+            &[
+                ("query", query.to_string()),
+                ("page", page.max(1).to_string()),
+            ],
+        )
+        .await
+    }
 }
 
 /// Prefer localized name, then original_name / title.
