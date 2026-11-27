@@ -757,6 +757,15 @@ async fn patch_task_scheduler(
     scheduler::save(&state, &cfg)
         .await
         .map_err(|e| AppError::bad_request("SCHEDULER_SAVE", e.to_string()))?;
+    audit::write_user(
+        &state.db,
+        user.id,
+        "task.scheduler.update",
+        "task_scheduler_setting",
+        "config",
+        None,
+    )
+    .await;
     Ok(Json(scheduler_to_frontend(&cfg)))
 }
 

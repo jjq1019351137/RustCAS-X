@@ -1,6 +1,7 @@
 use crate::auth_ctx::{require_perm, CurrentUser};
 use crate::error::{AppError, AppResult};
 use crate::services::magic_rename;
+use crate::services::audit;
 use crate::settings_store::{get_or_default, put_typed};
 use crate::state::AppState;
 use axum::extract::{Path, State};
@@ -98,7 +99,10 @@ async fn patch_rule(
         return Err(AppError::bad_request("MAGIC_RULE_NOT_FOUND", "规则不存在"));
     }
     let mut overrides = load_overrides(&state).await;
-    let entry = overrides.rules.entry(key).or_insert_with(|| json!({}));
+    let entry = overrides
+        .rules
+        .entry(key.clone())
+        .or_insert_with(|| json!({}));
     if let Some(obj) = entry.as_object_mut() {
         if let Some(v) = payload.enabled {
             obj.insert("enabled".into(), json!(v));
@@ -116,6 +120,15 @@ async fn patch_rule(
     put_typed(&state.db, "magic_regex_overrides", &overrides)
         .await
         .map_err(|e| AppError::bad_request("MAGIC_RULE_SAVE", e.to_string()))?;
+    audit::write_user(
+        &state.db,
+        user.id,
+        "magic_regex.update",
+        "magic_regex",
+        &key,
+        None,
+    )
+    .await;
     Ok(Json(json!({ "rules": merge_rules(&overrides) })))
 }
 
@@ -130,6 +143,15 @@ async fn delete_rule(
     put_typed(&state.db, "magic_regex_overrides", &overrides)
         .await
         .map_err(|e| AppError::bad_request("MAGIC_RULE_SAVE", e.to_string()))?;
+    audit::write_user(
+        &state.db,
+        user.id,
+        "magic_regex.reset",
+        "magic_regex",
+        &key,
+        None,
+    )
+    .await;
     Ok(Json(json!({ "rules": merge_rules(&overrides) })))
 }
 

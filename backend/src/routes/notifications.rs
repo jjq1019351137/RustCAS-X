@@ -1,5 +1,6 @@
 use crate::auth_ctx::{require_perm, CurrentUser};
 use crate::error::AppResult;
+use crate::services::audit;
 use crate::settings_store::{get_or_default, put_typed};
 use crate::state::AppState;
 use axum::extract::State;
@@ -167,6 +168,15 @@ async fn patch_config(
     }
     setting.updated_at = Some(Utc::now().to_rfc3339());
     put_typed(&state.db, "notification_config", &setting).await?;
+    audit::write_user(
+        &state.db,
+        user.id,
+        "notification.config.update",
+        "notification",
+        "config",
+        None,
+    )
+    .await;
     Ok(Json(json!({
         "config": setting.config,
         "default_config": default_config(),

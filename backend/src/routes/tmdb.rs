@@ -1,6 +1,7 @@
 use crate::auth_ctx::{require_perm, CurrentUser};
 use crate::error::{AppError, AppResult};
 use crate::services::tmdb::{self, TmdbClient, TmdbConfig};
+use crate::services::audit;
 use crate::settings_store::{get_or_default, put_typed};
 use crate::state::AppState;
 use axum::extract::{Query, State};
@@ -74,6 +75,15 @@ async fn patch_config(
         cfg.guessit_tmdb_movie_rename_template = v;
     }
     put_typed(&state.db, "tmdb_config", &cfg).await?;
+    audit::write_user(
+        &state.db,
+        user.id,
+        "tmdb.config.update",
+        "tmdb",
+        "config",
+        None,
+    )
+    .await;
     Ok(Json(to_out(&cfg)))
 }
 

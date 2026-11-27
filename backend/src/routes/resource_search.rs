@@ -1,5 +1,6 @@
 use crate::auth_ctx::{require_perm, CurrentUser};
 use crate::error::{AppError, AppResult};
+use crate::services::audit;
 use crate::services::resource_search::{self, SourcePatch};
 use crate::state::AppState;
 use axum::extract::{Path, State};
@@ -45,6 +46,15 @@ async fn patch_source(
     )
     .await
     .map_err(|e| AppError::bad_request("RESOURCE_SEARCH", e.to_string()))?;
+    audit::write_user(
+        &state.db,
+        user.id,
+        "resource_search.source.update",
+        "resource_search",
+        &key,
+        None,
+    )
+    .await;
     Ok(Json(out))
 }
 

@@ -226,6 +226,18 @@ async fn actions_registry(user: CurrentUser) -> AppResult<Json<Value>> {
             {"code": "user.status", "label": "启停用户", "category": "user", "category_label": "用户"},
             {"code": "user.roles", "label": "设置用户角色", "category": "user", "category_label": "用户"},
             {"code": "openlist.config.update", "label": "更新 OpenList", "category": "system", "category_label": "系统"},
+            {"code": "sync.create", "label": "创建同步任务", "category": "sync", "category_label": "同步"},
+            {"code": "sync.update", "label": "更新同步任务", "category": "sync", "category_label": "同步"},
+            {"code": "sync.delete", "label": "删除同步任务", "category": "sync", "category_label": "同步"},
+            {"code": "sync.import", "label": "导入同步任务", "category": "sync", "category_label": "同步"},
+            {"code": "sync.run", "label": "执行同步任务", "category": "sync", "category_label": "同步"},
+            {"code": "system.save_rules.update", "label": "更新转存规则", "category": "system", "category_label": "系统"},
+            {"code": "system.scheduler.update", "label": "更新系统调度", "category": "system", "category_label": "系统"},
+            {"code": "task.scheduler.update", "label": "更新任务调度", "category": "task", "category_label": "任务"},
+            {"code": "notification.config.update", "label": "更新通知配置", "category": "notification", "category_label": "通知"},
+            {"code": "tmdb.config.update", "label": "更新 TMDB 配置", "category": "tmdb", "category_label": "TMDB"},
+            {"code": "magic_regex.update", "label": "更新魔法正则", "category": "system", "category_label": "系统"},
+            {"code": "resource_search.source.update", "label": "更新搜索源", "category": "system", "category_label": "系统"},
             {"code": "plugin.refresh", "label": "刷新插件", "category": "plugin", "category_label": "插件"},
             {"code": "plugin.update", "label": "更新插件", "category": "plugin", "category_label": "插件"},
             {"code": "auth.login", "label": "登录", "category": "auth", "category_label": "认证"}
@@ -238,7 +250,9 @@ async fn actions_registry(user: CurrentUser) -> AppResult<Json<Value>> {
             "plugin": "插件",
             "auth": "认证",
             "system": "系统",
-            "openlist": "OpenList"
+            "openlist": "OpenList",
+            "notification": "通知",
+            "tmdb": "TMDB"
         },
         "sources": {
             "manual": "手动",

@@ -1,6 +1,7 @@
 use crate::auth_ctx::{require_perm, CurrentUser};
 use crate::error::AppResult;
 use crate::runtime::scheduler::{self, SchedulerConfig};
+use crate::services::audit;
 use crate::settings_store::{get_or_default, put_typed};
 use crate::state::AppState;
 use axum::extract::State;
@@ -39,6 +40,15 @@ async fn patch_save_rules(
         cfg.enable_skip_transferred_history = v;
     }
     put_typed(&state.db, "save_rules", &cfg).await?;
+    audit::write_user(
+        &state.db,
+        user.id,
+        "system.save_rules.update",
+        "system_setting",
+        "save_rules",
+        None,
+    )
+    .await;
     Ok(Json(cfg))
 }
 
@@ -78,6 +88,15 @@ async fn patch_scheduler(
         cfg.hours = v;
     }
     scheduler::save(&state, &cfg).await?;
+    audit::write_user(
+        &state.db,
+        user.id,
+        "system.scheduler.update",
+        "system_setting",
+        "scheduler",
+        None,
+    )
+    .await;
     Ok(Json(cfg))
 }
 

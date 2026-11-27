@@ -14,17 +14,27 @@
 | --- | --- | --- |
 | 0 | HTTP 壳、SQLite migrate、auth/setup/health、Docker/GHA | **done** |
 | 1 | users/roles/permissions、system save-rules、app_settings KV | **done** |
-| 2 | quark/cloud189：init/ls_dir/stoken/detail + **mkdir/get_fids/save_file/query_task** | **done（天翼账密登录/验证码待全量）** |
-| 3 | drama run：stoken → 列表 → mkdir(savepath) → **转存并等待任务** | **done（TMDB 重命名/集数过滤待全量）** |
-| 4 | sync run/stream + deferred_sync_deletes 队列 | **done（文件同步待全量）** |
-| 5 | TMDB/OpenList settings；OpenList browse HTTP 客户端 | **done（TMDB API/缓存待全量）** |
+| 2 | quark/cloud189：init/ls_dir/stoken/detail + **mkdir/get_fids/save_file/query_task** | **done（天翼账密登录/验证码已放弃深度）** |
+| 3 | drama run：stoken → 列表 → mkdir(savepath) → **转存并等待任务** | **done** |
+| 4 | sync run/stream + deferred_sync_deletes 队列 | **done** |
+| 5 | TMDB/OpenList settings；OpenList browse HTTP 客户端 | **done** |
+| 6 | 追剧失败自动修链 + repair-banned 后重跑 | **done** |
+| 7 | 豆瓣发现页 + proxy-image 缓存 | **done** |
+| 8 | 审计列表/写入、插件空注册表、网盘探针调度 | **done** |
+| 9 | 同步/设置类写操作审计补齐 | **done** |
+
+## Quark-first 约定
+
+- **主线**：夸克追剧 / 同步 / 分享预览 / 资源搜索 / 通知 / TMDB / OpenList
+- **放弃**：天翼深度登录验证码、dl302 / strm 全量、插件运行时执行
+- **可空操作**：savepath snapshots、lsdir-cache refresh（返回稳定 shape）
 
 ## 下一步优先
 
-1. Quark/Cloud189：`init` / `ls_dir` / `get_stoken` / `save_file` 对齐 Python 行为并用 rust-anything `record/diff`  
-2. Drama：TMDB 进度 + 目录匹配 + 转存闭环  
-3. Sync：本地↔网盘 walk/copy + 删除延时真实落地  
-4. 通知插件 / 调度 crontab  
+1. Docker 镜像联调 / 前端回归清单（追剧、修链、豆瓣、探针）
+2. Sync 文件级 walk/copy 与延时删除行为对照
+3. 通知渠道边角（webhook 鉴权头等）
+4. 插件运行时（若需要再开波次）
 
 ## 兼容约定
 
@@ -32,4 +42,4 @@
 - 密码：bcrypt
 - JWT：HS256，`sub` + `perms`
 - Refresh：HttpOnly cookie `refresh_token` + SHA256(pepper)
-- 驱动类型：仅 `quark` / `cloud189`
+- 驱动类型：`quark`（主）/ `cloud189`（保留壳，不继续深迁）

@@ -1,6 +1,7 @@
 use crate::auth_ctx::{require_perm, CurrentUser};
 use crate::error::{AppError, AppResult};
 use crate::runtime::sync as sync_runtime;
+use crate::services::audit;
 use crate::services::share_preview::{browse_drive, DriveBrowseIn};
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
@@ -218,6 +219,15 @@ async fn create_sync_task(
     .fetch_one(&state.db)
     .await?;
 
+    audit::write_user(
+        &state.db,
+        user.id,
+        "sync.create",
+        "sync_task",
+        id,
+        Some(&payload.name),
+    )
+    .await;
     Ok(Json(fetch_one(&state, id).await?))
 }
 
@@ -265,6 +275,15 @@ async fn patch_sync_task(
     .bind(sync_task_id)
     .execute(&state.db)
     .await?;
+    audit::write_user(
+        &state.db,
+        user.id,
+        "sync.update",
+        "sync_task",
+        sync_task_id,
+        None,
+    )
+    .await;
     Ok(Json(fetch_one(&state, sync_task_id).await?))
 }
 
@@ -282,6 +301,15 @@ async fn delete_sync_task(
     if n == 0 {
         return Err(AppError::bad_request("SYNC_NOT_FOUND", "同步任务不存在"));
     }
+    audit::write_user(
+        &state.db,
+        user.id,
+        "sync.delete",
+        "sync_task",
+        sync_task_id,
+        None,
+    )
+    .await;
     Ok(Json(json!({ "ok": true, "id": sync_task_id })))
 }
 
@@ -361,6 +389,18 @@ async fn import_sync_tasks(
             }
         }
     }
+    audit::write_user(
+        &state.db,
+        user.id,
+        "sync.import",
+        "sync_task",
+        "*",
+        Some(&format!(
+            "created={created} updated={updated} skipped={skipped} failed={}",
+            failed.len()
+        )),
+    )
+    .await;
     Ok(Json(json!({
         "ok": true,
         "created": created,
@@ -380,6 +420,15 @@ async fn run_sync(
     let (exec_id, log) = sync_runtime::run_once(&state, sync_task_id)
         .await
         .map_err(|e| AppError::bad_request("SYNC_RUN", e.to_string()))?;
+    audit::write_user(
+        &state.db,
+        user.id,
+        "sync.run",
+        "sync_task",
+        sync_task_id,
+        Some(&format!("exec_id={exec_id}")),
+    )
+    .await;
     Ok(Json(json!({
         "id": exec_id,
         "sync_task_id": sync_task_id,
