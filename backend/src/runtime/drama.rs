@@ -3,7 +3,8 @@ use crate::services::episode::{
     format_episode_anchor, is_before_start_episode, name_exists_in_dest, parse_episode_anchor,
     resolve_start_episode_key,
 };
-use crate::services::rename::{matches_pattern, rename_preview};
+use crate::services::magic_rename::{passes_magic_keyword_filter, MagicRename};
+use crate::services::rename::{matches_pattern, rename_preview_with_taskname};
 use crate::services::tmdb::{self, TmdbClient};
 use crate::settings_store::get_or_default;
 use crate::state::AppState;
@@ -239,25 +240,30 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
     };
     log.push_str(&format!("dest_fid={dest_fid}\n"));
 
-    // Dest file names for skip-existing
+    // Dest file names / fids for skip-existing or replace-delete
     let dest_list = adapter.ls_dir(&dest_fid, 500).await.unwrap_or(json!({}));
-    let dest_names: Vec<String> = dest_list
+    let dest_items: Vec<Value> = dest_list
         .pointer("/data/list")
         .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|it| {
-            let is_dir = it
-                .get("dir")
-                .or_else(|| it.get("is_dir"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if is_dir {
-                return None;
-            }
-            item_name(it)
-        })
-        .collect();
+        .cloned()
+        .unwrap_or_default();
+    let mut dest_names: Vec<String> = Vec::new();
+    let mut dest_name_to_fid: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for it in &dest_items {
+        let is_dir = it
+            .get("dir")
+            .or_else(|| it.get("is_dir"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if is_dir {
+            continue;
+        }
+        if let (Some(fid), Some(name)) = (item_fid(it), item_name(it)) {
+            dest_names.push(name.clone());
+            dest_name_to_fid.insert(name, fid);
+        }
+    }
     log.push_str(&format!("dest existing files={}\n", dest_names.len()));
 
     let share_fid_names: Vec<(String, String)> = items
@@ -278,9 +284,14 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
             format_episode_anchor(sk.0, sk.1)
         ));
     }
+
+    let mut mr = MagicRename::new();
+    mr.set_taskname(&taskname);
+    let magic_key = pattern.clone();
+    let (pattern, replace) = mr.magic_regex_conv(&pattern, &replace);
     if !pattern.trim().is_empty() {
         log.push_str(&format!(
-            "pattern filter len={} replace_len={}\n",
+            "pattern(after magic) key={magic_key} len={} replace_len={}\n",
             pattern.len(),
             replace.len()
         ));
@@ -288,11 +299,14 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
 
     let tv_tpl = tmdb_cfg.guessit_tmdb_tv_rename_template.clone();
     let disable_fb = tmdb_cfg.disable_guessit_tmdb_fallback_rename;
+    // Quark: replace same-name dest before save; other drives keep skip
+    let replace_existing = drive_type == "quark";
 
     let mut fid_list = Vec::new();
     let mut token_list = Vec::new();
     let mut rename_plan: Vec<(String, String)> = Vec::new(); // origin -> target (diff only)
     let mut saved_pairs: Vec<(String, String)> = Vec::new(); // all saved origin/target
+    let mut pending_delete: Vec<String> = Vec::new();
     let mut skipped_pattern = 0usize;
     let mut skipped_start = 0usize;
     let mut skipped_exist = 0usize;
@@ -309,15 +323,20 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
         let Some(fid) = item_fid(item) else { continue };
         let Some(name) = item_name(item) else { continue };
 
+        if !passes_magic_keyword_filter(&magic_key, &name) {
+            skipped_pattern += 1;
+            continue;
+        }
         if !matches_pattern(&name, &pattern) {
             skipped_pattern += 1;
             continue;
         }
 
-        let renamed = rename_preview(
+        let renamed = rename_preview_with_taskname(
             &name,
             &pattern,
             &replace,
+            &taskname,
             series_title.as_deref(),
             Some(tv_tpl.as_str()),
             disable_fb,
@@ -331,12 +350,30 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
             }
         }
 
-        if name_exists_in_dest(&renamed, &dest_names, ignore_ext)
-            || name_exists_in_dest(&name, &dest_names, ignore_ext)
-        {
-            skipped_exist += 1;
-            log.push_str(&format!("跳过已存在: {name} -> {renamed}\n"));
-            continue;
+        let exists = name_exists_in_dest(&renamed, &dest_names, ignore_ext)
+            || name_exists_in_dest(&name, &dest_names, ignore_ext);
+        if exists {
+            if replace_existing {
+                // Queue dest fids that collide with origin/target name for delete
+                for (dn, dfid) in &dest_name_to_fid {
+                    let hit = if ignore_ext {
+                        let a = dn.rsplit_once('.').map(|(s, _)| s).unwrap_or(dn);
+                        let b = renamed.rsplit_once('.').map(|(s, _)| s).unwrap_or(&renamed);
+                        let c = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&name);
+                        a.eq_ignore_ascii_case(b) || a.eq_ignore_ascii_case(c)
+                    } else {
+                        dn == &renamed || dn == &name
+                    };
+                    if hit {
+                        pending_delete.push(dfid.clone());
+                    }
+                }
+                log.push_str(&format!("将覆盖已存在: {name} -> {renamed}\n"));
+            } else {
+                skipped_exist += 1;
+                log.push_str(&format!("跳过已存在: {name} -> {renamed}\n"));
+                continue;
+            }
         }
 
         if skip_history && is_history_hit(&history_set, &name, &renamed) {
@@ -372,6 +409,19 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
 
     if fid_list.is_empty() {
         return finish(state, exec_id, "skipped", "no new files to transfer", &mut log).await;
+    }
+
+    if !pending_delete.is_empty() {
+        pending_delete.sort();
+        pending_delete.dedup();
+        log.push_str(&format!("delete conflicting dest count={}\n", pending_delete.len()));
+        match adapter.delete(&pending_delete).await {
+            Ok(ret) => log.push_str(&format!(
+                "delete code/status={:?}\n",
+                ret.get("code").or_else(|| ret.get("status"))
+            )),
+            Err(e) => log.push_str(&format!("delete err: {e}\n")),
+        }
     }
 
     log.push_str(&format!("save_file count={}\n", fid_list.len()));

@@ -569,6 +569,25 @@ impl CloudDriveAdapter for QuarkAdapter {
             .await
     }
 
+    async fn delete(&self, filelist: &[String]) -> anyhow::Result<Value> {
+        if filelist.is_empty() {
+            return Ok(json!({ "code": 0, "message": "success", "data": {} }));
+        }
+        let url = format!("{BASE_URL}/1/clouddrive/file/delete");
+        let params = vec![
+            ("pr".into(), "ucpro".into()),
+            ("fr".into(), "pc".into()),
+            ("uc_param_str".into(), "".into()),
+        ];
+        let payload = json!({
+            "action_type": 2,
+            "filelist": filelist,
+            "exclude_fids": []
+        });
+        self.send_json(reqwest::Method::POST, url, params, Some(payload))
+            .await
+    }
+
     fn config(&self) -> &HashMap<String, Value> {
         &self.config
     }

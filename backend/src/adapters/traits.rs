@@ -84,6 +84,13 @@ pub trait CloudDriveAdapter: Send + Sync {
         }))
     }
 
+    async fn delete(&self, _filelist: &[String]) -> anyhow::Result<Value> {
+        Ok(json!({
+            "code": -1,
+            "message": format!("{} delete pending", self.drive_type())
+        }))
+    }
+
     fn config(&self) -> &HashMap<String, Value>;
 }
 

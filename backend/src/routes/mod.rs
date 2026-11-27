@@ -2,6 +2,7 @@ mod auth;
 mod dashboard;
 mod drive_accounts;
 mod health;
+mod magic_regex;
 mod openlist;
 mod roles;
 mod setup;
@@ -29,6 +30,7 @@ pub fn api_router(state: AppState) -> Router {
         .nest("/permissions", roles::permissions_router())
         .nest("/system-settings", system_settings::router())
         .nest("/tmdb", tmdb::router())
+        .nest("/magic-regex", magic_regex::router())
         .nest("/openlist", openlist::router())
         .merge(stubs::router())
         .with_state(state)

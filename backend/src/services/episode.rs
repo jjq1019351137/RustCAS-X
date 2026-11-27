@@ -1,4 +1,4 @@
-//! Episode anchor parsing / start-episode filtering (port of start_episode_filter.py).
+//! Episode anchor parsing / start-episode filtering (port of start_episode_filter.py + guessit-ish CN).
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -10,13 +10,42 @@ fn re_se() -> &'static Regex {
 
 fn re_e_only() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    // Avoid lookbehind: use capture of preceding non-alnum or start.
     RE.get_or_init(|| Regex::new(r"(?:^|[^A-Za-z0-9])[Ee][Pp]?(\d{1,4})\b").unwrap())
 }
 
 fn re_bare() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^[Ee]?(\d{1,4})$").unwrap())
+}
+
+fn re_cn_ep() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"第\s*0*(\d{1,4})\s*[集期话部篇]").unwrap())
+}
+
+fn re_cn_ep_bare() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?:^|[^\d第])0*(\d{1,4})\s*集").unwrap())
+}
+
+fn re_cn_season() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"第\s*([0-9一二两三四五六七八九十]{1,3})\s*季").unwrap())
+}
+
+fn re_leading_ep() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // 01.Show / 12 1080p / 05-title
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)^\s*(\d{1,4})(?:\s*(?:\(\s*v\d+\s*\)|v\d+))?\s*(?:[-._\s]+|$)").unwrap()
+    })
+}
+
+fn re_leading_ep_res() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)^\s*(\d{1,4})(?:\s*(?:\(\s*v\d+\s*\)|v\d+))?\s*[\s._\-\\/／~]+\s*(?:4k|8k|2160p|1080p|720p)(?:[\s._\-\\/／].*)?$").unwrap()
+    })
 }
 
 pub type EpisodeKey = (Option<i32>, i32);
@@ -26,6 +55,42 @@ pub fn format_episode_anchor(season: Option<i32>, episode: i32) -> String {
         Some(s) if s > 0 => format!("S{s:02}E{episode:02}"),
         _ => format!("E{episode}"),
     }
+}
+
+fn cn_num(s: &str) -> Option<i32> {
+    if let Ok(n) = s.parse::<i32>() {
+        return Some(n);
+    }
+    let map = [
+        ('一', 1),
+        ('二', 2),
+        ('两', 2),
+        ('三', 3),
+        ('四', 4),
+        ('五', 5),
+        ('六', 6),
+        ('七', 7),
+        ('八', 8),
+        ('九', 9),
+        ('十', 10),
+    ];
+    if s.chars().count() == 1 {
+        return map.iter().find(|(c, _)| s.starts_with(*c)).map(|(_, n)| *n);
+    }
+    if s.starts_with('十') {
+        let rest = s.chars().nth(1);
+        if rest.is_none() {
+            return Some(10);
+        }
+        let ones = map.iter().find(|(c, _)| rest == Some(*c)).map(|(_, n)| *n)?;
+        return Some(10 + ones);
+    }
+    if s.ends_with('十') {
+        let first = s.chars().next()?;
+        let tens = map.iter().find(|(c, _)| *c == first).map(|(_, n)| *n)?;
+        return Some(tens * 10);
+    }
+    None
 }
 
 pub fn parse_episode_anchor(value: &str) -> Option<EpisodeKey> {
@@ -44,15 +109,53 @@ pub fn parse_episode_anchor(value: &str) -> Option<EpisodeKey> {
     if let Some(c) = re_se().captures(candidate) {
         let season = c.get(1)?.as_str().parse::<i32>().ok()?;
         let episode = c.get(2)?.as_str().parse::<i32>().ok()?;
-        return Some((Some(season), episode));
+        if episode > 0 {
+            return Some((Some(season), episode));
+        }
+    }
+
+    let mut season_hint: Option<i32> = None;
+    if let Some(c) = re_cn_season().captures(candidate) {
+        season_hint = cn_num(c.get(1)?.as_str());
+    }
+
+    if let Some(c) = re_cn_ep().captures(candidate) {
+        let episode = c.get(1)?.as_str().parse::<i32>().ok()?;
+        if episode > 0 {
+            return Some((season_hint, episode));
+        }
+    }
+    if let Some(c) = re_cn_ep_bare().captures(candidate) {
+        let episode = c.get(1)?.as_str().parse::<i32>().ok()?;
+        if episode > 0 {
+            return Some((season_hint, episode));
+        }
     }
     if let Some(c) = re_e_only().captures(candidate) {
         let episode = c.get(1)?.as_str().parse::<i32>().ok()?;
-        return Some((None, episode));
+        if episode > 0 {
+            return Some((season_hint, episode));
+        }
     }
     if let Some(c) = re_bare().captures(candidate) {
         let episode = c.get(1)?.as_str().parse::<i32>().ok()?;
-        return Some((None, episode));
+        if episode > 0 && episode <= 9999 {
+            return Some((season_hint, episode));
+        }
+    }
+    // Strict known: "12 1080p" / leading episode
+    if let Some(c) = re_leading_ep_res().captures(candidate) {
+        let episode = c.get(1)?.as_str().parse::<i32>().ok()?;
+        if (1..=9999).contains(&episode) {
+            return Some((season_hint.or(Some(1)), episode));
+        }
+    }
+    if let Some(c) = re_leading_ep().captures(candidate) {
+        let episode = c.get(1)?.as_str().parse::<i32>().ok()?;
+        // Avoid years like 2024 at start
+        if (1..=999).contains(&episode) {
+            return Some((season_hint.or(Some(1)), episode));
+        }
     }
     None
 }
@@ -118,6 +221,13 @@ mod tests {
         assert_eq!(parse_episode_anchor("Show.S01E12.mkv"), Some((Some(1), 12)));
         assert_eq!(parse_episode_anchor("E08"), Some((None, 8)));
         assert_eq!(parse_episode_anchor("S01E92"), Some((Some(1), 92)));
+    }
+
+    #[test]
+    fn parse_cn() {
+        assert_eq!(parse_episode_anchor("剧名 第12集.mkv"), Some((None, 12)));
+        assert_eq!(parse_episode_anchor("第2季第5集.mp4"), Some((Some(2), 5)));
+        assert_eq!(parse_episode_anchor("12.1080p.mkv"), Some((Some(1), 12)));
     }
 
     #[test]

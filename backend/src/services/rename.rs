@@ -1,6 +1,7 @@
-//! Filename pattern replace + TMDB-style SxxExx rename fallback.
+//! Filename pattern replace + magic-regex + guessit-style TMDB rename fallback.
 
 use crate::services::episode::parse_episode_anchor;
+use crate::services::magic_rename::MagicRename;
 use regex::Regex;
 
 pub fn apply_pattern_replace(origin: &str, pattern: &str, replace: &str) -> String {
@@ -13,7 +14,6 @@ pub fn apply_pattern_replace(origin: &str, pattern: &str, replace: &str) -> Stri
         return origin.to_string();
     };
     if replace.is_empty() {
-        // filter-only mode: keep original name
         return origin.to_string();
     }
     re.replace(origin, replace).to_string()
@@ -53,20 +53,25 @@ pub fn tmdb_fallback_rename(
     let ee = episode;
     let tpl = template.unwrap_or("").trim();
     if !tpl.is_empty() {
+        let title_dot = title.replace(' ', ".");
         let mut out = tpl
             .replace("{title}", title)
+            .replace("{title_dot}", &title_dot)
             .replace("{name}", title)
             .replace("{season}", &format!("{ss:02}"))
             .replace("{episode}", &format!("{ee:02}"))
+            .replace("{season_num}", &ss.to_string())
+            .replace("{episode_num}", &ee.to_string())
             .replace("{S}", &format!("S{ss:02}"))
             .replace("{E}", &format!("E{ee:02}"))
             .replace("{ext}", &ext);
         if !ext.is_empty() && !out.to_lowercase().ends_with(&ext.to_lowercase()) {
             out.push_str(&ext);
         }
+        out = sanitize_filename(&out);
         return Some(out);
     }
-    Some(format!("{title}.S{ss:02}E{ee:02}{ext}"))
+    Some(sanitize_filename(&format!("{title}.S{ss:02}E{ee:02}{ext}")))
 }
 
 pub fn rename_preview(
@@ -77,13 +82,41 @@ pub fn rename_preview(
     tv_template: Option<&str>,
     disable_tmdb_fallback: bool,
 ) -> String {
-    let pattern = pattern.trim();
-    let replace = replace.trim();
-    if is_filter_only(pattern, replace) {
+    rename_preview_with_taskname(
+        origin,
+        pattern,
+        replace,
+        "",
+        series_title,
+        tv_template,
+        disable_tmdb_fallback,
+    )
+}
+
+pub fn rename_preview_with_taskname(
+    origin: &str,
+    pattern: &str,
+    replace: &str,
+    taskname: &str,
+    series_title: Option<&str>,
+    tv_template: Option<&str>,
+    disable_tmdb_fallback: bool,
+) -> String {
+    let mut mr = MagicRename::new();
+    mr.set_taskname(taskname);
+    let (pattern, replace) = mr.magic_regex_conv(pattern, replace);
+    let pattern = pattern.trim().to_string();
+    let replace = replace.trim().to_string();
+
+    if is_filter_only(&pattern, &replace) {
         return origin.to_string();
     }
     if !pattern.is_empty() {
-        return apply_pattern_replace(origin, pattern, replace);
+        // Magic templates with {TASKNAME}/{SXX}/… go through MagicRename::sub
+        if replace.contains('{') {
+            return mr.sub(&pattern, &replace, origin);
+        }
+        return apply_pattern_replace(origin, &pattern, &replace);
     }
     if !disable_tmdb_fallback {
         if let Some(title) = series_title.filter(|s| !s.trim().is_empty()) {
@@ -95,9 +128,24 @@ pub fn rename_preview(
     origin.to_string()
 }
 
-fn is_video_name(name: &str) -> bool {
+fn sanitize_filename(name: &str) -> String {
+    let mut s = name.to_string();
+    for ch in ['\\', '/', ':', '*', '?', '"', '<', '>', '|'] {
+        s = s.replace(ch, " ");
+    }
+    while s.contains("  ") {
+        s = s.replace("  ", " ");
+    }
+    while s.contains("..") {
+        s = s.replace("..", ".");
+    }
+    s.trim().trim_matches('.').to_string()
+}
+
+pub fn is_video_name(name: &str) -> bool {
     const EXTS: &[&str] = &[
-        ".mkv", ".mp4", ".ts", ".m2ts", ".avi", ".mov", ".wmv", ".flv", ".webm", ".iso",
+        ".mkv", ".mp4", ".ts", ".m2ts", ".avi", ".mov", ".wmv", ".flv", ".webm", ".iso", ".m4v",
+        ".mpeg", ".mpg", ".rmvb", ".cas", ".zip",
     ];
     let lower = name.to_lowercase();
     EXTS.iter().any(|e| lower.ends_with(e))
