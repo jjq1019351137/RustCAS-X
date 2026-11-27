@@ -1,6 +1,9 @@
 use crate::adapters::{create_adapter, drive_types, serialize_cookie};
 use crate::auth_ctx::{require_perm, CurrentUser};
 use crate::error::{AppError, AppResult};
+use crate::services::audit;
+use crate::services::drive_probe::{self, ProbeSchedulerConfig};
+use crate::settings_store::{get_or_default, put_typed};
 use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::routing::{get, patch, post};
@@ -214,6 +217,16 @@ async fn create_account(
     .fetch_one(&state.db)
     .await?;
 
+    audit::write_user(
+        &state.db,
+        user.id,
+        "drive_account.create",
+        "drive_account",
+        id,
+        Some(&payload.name),
+    )
+    .await;
+
     Ok(Json(account_out(
         id,
         payload.name,
@@ -298,6 +311,15 @@ async fn patch_account(
     .execute(&state.db)
     .await?;
 
+    audit::write_user(
+        &state.db,
+        user.id,
+        "drive_account.update",
+        "drive_account",
+        account_id,
+        None,
+    )
+    .await;
     list_one(&state, account_id).await
 }
 
@@ -349,6 +371,15 @@ async fn patch_status(
         .bind(account_id)
         .execute(&state.db)
         .await?;
+    audit::write_user(
+        &state.db,
+        user.id,
+        "drive_account.status",
+        "drive_account",
+        account_id,
+        Some(&format!("enabled={}", payload.enabled)),
+    )
+    .await;
     list_one(&state, account_id).await
 }
 
@@ -366,6 +397,15 @@ async fn set_default(
         .bind(account_id)
         .execute(&state.db)
         .await?;
+    audit::write_user(
+        &state.db,
+        user.id,
+        "drive_account.default",
+        "drive_account",
+        account_id,
+        None,
+    )
+    .await;
     list_one(&state, account_id).await
 }
 
@@ -383,6 +423,15 @@ async fn delete_account(
     if n == 0 {
         return Err(AppError::not_found("DRIVE_NOT_FOUND", "账号不存在"));
     }
+    audit::write_user(
+        &state.db,
+        user.id,
+        "drive_account.delete",
+        "drive_account",
+        account_id,
+        None,
+    )
+    .await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -392,43 +441,140 @@ async fn probe(
     Path(account_id): Path<i64>,
 ) -> AppResult<Json<Value>> {
     require_perm(&user, "drive_account:write")?;
-    let row = sqlx::query_as::<_, (String, String, Option<String>)>(
-        "SELECT drive_type, cookie, config_json FROM drive_accounts WHERE id = ?",
+    let exists: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM drive_accounts WHERE id = ?")
+            .bind(account_id)
+            .fetch_optional(&state.db)
+            .await?;
+    if exists.is_none() {
+        return Err(AppError::not_found("DRIVE_NOT_FOUND", "账号不存在"));
+    }
+    let ok = drive_probe::probe_account(&state, account_id)
+        .await
+        .map_err(|e| AppError::bad_request("PROBE", e.to_string()))?;
+    audit::write_user(
+        &state.db,
+        user.id,
+        "drive_account.probe",
+        "drive_account",
+        account_id,
+        Some(&format!("ok={ok}")),
     )
-    .bind(account_id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::not_found("DRIVE_NOT_FOUND", "账号不存在"))?;
-
-    let config: Value = row
-        .2
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(|| json!({}));
-    let mut adapter = create_adapter(&row.0, Some(&config), Some(&row.1))
-        .map_err(|e| AppError::bad_request("ADAPTER", e.to_string()))?;
-    let init = adapter.init().await.unwrap_or_else(|e| json!({ "ok": false, "message": e.to_string() }));
-    let ok = init.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-    let now = Utc::now().to_rfc3339();
-    let profile = if ok { Some(init.to_string()) } else { None };
-    sqlx::query(
-        r#"
-        UPDATE drive_accounts
-        SET runtime_status=?, last_checked_at=?, last_error=?, profile_json=COALESCE(?, profile_json),
-            probe_fail_count=CASE WHEN ? THEN 0 ELSE probe_fail_count+1 END, updated_at=?
-        WHERE id=?
-        "#,
-    )
-    .bind(if ok { "ok" } else { "error" })
-    .bind(&now)
-    .bind(init.get("message").and_then(|v| v.as_str()))
-    .bind(profile)
-    .bind(ok)
-    .bind(&now)
-    .bind(account_id)
-    .execute(&state.db)
-    .await?;
+    .await;
     list_one(&state, account_id).await
+}
+
+async fn get_probe_scheduler(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "drive_account:read")?;
+    let cfg: ProbeSchedulerConfig = get_or_default(&state.db, "drive_probe_scheduler").await?;
+    Ok(Json(json!({
+        "enabled": cfg.enabled,
+        "crontab": cfg.crontab,
+        "timezone": cfg.timezone,
+        "enabled_only": cfg.enabled_only
+    })))
+}
+
+#[derive(Deserialize, Default)]
+struct ProbeSchedulerPatch {
+    enabled: Option<bool>,
+    crontab: Option<String>,
+    timezone: Option<String>,
+    enabled_only: Option<bool>,
+}
+
+async fn patch_probe_scheduler(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(payload): Json<ProbeSchedulerPatch>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "drive_account:write")?;
+    let mut cfg: ProbeSchedulerConfig = get_or_default(&state.db, "drive_probe_scheduler").await?;
+    if let Some(v) = payload.enabled {
+        cfg.enabled = v;
+    }
+    if let Some(v) = payload.crontab {
+        cfg.crontab = v;
+    }
+    if let Some(v) = payload.timezone {
+        cfg.timezone = v;
+    }
+    if let Some(v) = payload.enabled_only {
+        cfg.enabled_only = v;
+    }
+    put_typed(&state.db, "drive_probe_scheduler", &cfg).await?;
+    audit::write_user(
+        &state.db,
+        user.id,
+        "drive_account.probe_scheduler.update",
+        "drive_account_probe_scheduler_setting",
+        "config",
+        None,
+    )
+    .await;
+    Ok(Json(json!({
+        "enabled": cfg.enabled,
+        "crontab": cfg.crontab,
+        "timezone": cfg.timezone,
+        "enabled_only": cfg.enabled_only
+    })))
+}
+
+async fn refresh_profiles(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "drive_account:write")?;
+    let ids: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM drive_accounts WHERE enabled = 1 ORDER BY id ASC")
+            .fetch_all(&state.db)
+            .await?;
+    for id in &ids {
+        let _ = drive_probe::probe_account(&state, *id).await;
+    }
+    audit::write_user(
+        &state.db,
+        user.id,
+        "drive_account.refresh_profiles",
+        "drive_account",
+        "*",
+        Some(&format!("count={}", ids.len())),
+    )
+    .await;
+    list_accounts(State(state), user).await
+}
+
+#[derive(Deserialize, Default)]
+struct LsdirRefreshIn {
+    #[serde(default)]
+    static_cache: Option<bool>,
+}
+
+async fn lsdir_cache_refresh(
+    user: CurrentUser,
+    Path(account_id): Path<i64>,
+    Json(_payload): Json<LsdirRefreshIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "drive_account:write")?;
+    // Quark-first: dl302/static lsdir cache not ported — return stable no-op shape.
+    Ok(Json(json!({
+        "account_id": account_id,
+        "cleared": 0,
+        "queued": false,
+        "base_path": null,
+        "reason": "lsdir cache not required for Quark-first wave",
+        "static_requested": false,
+        "static_queued": false,
+        "static_skipped_reason": "not_ported",
+        "refresh_status": {
+            "account_id": account_id,
+            "status": "idle",
+            "kind": "noop"
+        }
+    })))
 }
 
 async fn extract_share(
@@ -509,11 +655,14 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/types", get(list_types))
         .route("/lsdir-cache/status", get(lsdir_cache_status))
+        .route("/probe/scheduler", get(get_probe_scheduler).patch(patch_probe_scheduler))
+        .route("/refresh-profiles", post(refresh_profiles))
         .route("/", get(list_accounts).post(create_account))
         .route("/{account_id}", patch(patch_account).delete(delete_account))
         .route("/{account_id}/status", patch(patch_status))
         .route("/{account_id}/default", post(set_default))
         .route("/{account_id}/probe", post(probe))
+        .route("/{account_id}/lsdir-cache/refresh", post(lsdir_cache_refresh))
         .route("/{account_id}/extract-url", post(extract_share))
         .route("/{account_id}/lsdir", post(ls_dir))
 }

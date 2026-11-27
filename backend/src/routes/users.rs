@@ -1,6 +1,7 @@
 use crate::auth_ctx::{load_user_roles_permissions, require_perm, CurrentUser};
 use crate::error::{AppError, AppResult};
 use crate::security::{hash_password, validate_password_strength};
+use crate::services::audit;
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, patch, post};
@@ -135,6 +136,16 @@ async fn create_user(
     .await
     .map_err(|e| AppError::bad_request("USER_CREATE", e.to_string()))?;
 
+    audit::write_user(
+        &state.db,
+        user.id,
+        "user.create",
+        "user",
+        id,
+        Some(&payload.username),
+    )
+    .await;
+
     Ok(Json(json!({
         "id": id,
         "username": payload.username,
@@ -155,6 +166,15 @@ async fn set_status(
         .bind(user_id)
         .execute(&state.db)
         .await?;
+    audit::write_user(
+        &state.db,
+        user.id,
+        "user.status",
+        "user",
+        user_id,
+        Some(&format!("is_active={}", payload.is_active)),
+    )
+    .await;
     Ok(Json(json!({ "ok": true, "is_active": payload.is_active })))
 }
 
@@ -176,13 +196,91 @@ async fn set_roles(
             .execute(&state.db)
             .await?;
     }
+    audit::write_user(&state.db, user.id, "user.roles", "user", user_id, None).await;
     let (roles, permissions) = load_user_roles_permissions(&state.db, user_id).await?;
     Ok(Json(json!({ "roles": roles, "permissions": permissions })))
+}
+
+#[derive(Deserialize)]
+struct BatchStatusIn {
+    user_ids: Vec<i64>,
+    is_active: bool,
+}
+
+#[derive(Deserialize)]
+struct BatchRolesIn {
+    user_ids: Vec<i64>,
+    role_ids: Vec<i64>,
+}
+
+async fn batch_status(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(payload): Json<BatchStatusIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "user:write")?;
+    let mut updated = 0i64;
+    for uid in &payload.user_ids {
+        let n = sqlx::query("UPDATE users SET is_active=? WHERE id=?")
+            .bind(if payload.is_active { 1 } else { 0 })
+            .bind(uid)
+            .execute(&state.db)
+            .await?
+            .rows_affected();
+        updated += n as i64;
+    }
+    audit::write_user(
+        &state.db,
+        user.id,
+        "user.batch_status",
+        "user",
+        "*",
+        Some(&format!(
+            "count={} is_active={}",
+            payload.user_ids.len(),
+            payload.is_active
+        )),
+    )
+    .await;
+    Ok(Json(json!({ "ok": true, "updated": updated })))
+}
+
+async fn batch_roles(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(payload): Json<BatchRolesIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "user:write")?;
+    for uid in &payload.user_ids {
+        sqlx::query("DELETE FROM user_roles WHERE user_id = ?")
+            .bind(uid)
+            .execute(&state.db)
+            .await?;
+        for rid in &payload.role_ids {
+            sqlx::query("INSERT OR IGNORE INTO user_roles (user_id, role_id) VALUES (?, ?)")
+                .bind(uid)
+                .bind(rid)
+                .execute(&state.db)
+                .await?;
+        }
+    }
+    audit::write_user(
+        &state.db,
+        user.id,
+        "user.batch_roles",
+        "user",
+        "*",
+        Some(&format!("count={}", payload.user_ids.len())),
+    )
+    .await;
+    Ok(Json(json!({ "ok": true, "updated": payload.user_ids.len() })))
 }
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_users).post(create_user))
+        .route("/batch/status", post(batch_status))
+        .route("/batch/roles", post(batch_roles))
         .route("/{user_id}/status", patch(set_status))
         .route("/{user_id}/roles", post(set_roles))
 }

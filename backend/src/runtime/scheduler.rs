@@ -63,6 +63,7 @@ pub fn spawn(state: AppState) {
                 continue;
             }
             let result = run_tick(&state).await;
+            maybe_run_drive_probes(&state).await;
             TICKING.store(false, Ordering::SeqCst);
             if let Err(e) = result {
                 tracing::warn!(error = %e, "scheduler tick failed");
@@ -130,6 +131,14 @@ async fn run_tick(state: &AppState) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn maybe_run_drive_probes(state: &AppState) {
+    match crate::services::drive_probe::run_due_probes(state).await {
+        Ok(n) if n > 0 => tracing::info!(probed = n, "drive probe scheduler ran"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "drive probe scheduler failed"),
+    }
 }
 
 async fn due_drama_ids(state: &AppState, today_iso: i64) -> anyhow::Result<Vec<i64>> {

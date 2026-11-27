@@ -1,5 +1,6 @@
 use crate::auth_ctx::{require_perm, CurrentUser};
 use crate::error::{AppError, AppResult};
+use crate::services::audit;
 use crate::settings_store::{get_or_default, put_typed};
 use crate::state::AppState;
 use axum::extract::State;
@@ -54,6 +55,15 @@ async fn patch_config(
         cfg.token = v;
     }
     put_typed(&state.db, "openlist_config", &cfg).await?;
+    audit::write_user(
+        &state.db,
+        user.id,
+        "openlist.config.update",
+        "openlist",
+        "config",
+        None,
+    )
+    .await;
     Ok(Json(to_out(&cfg)))
 }
 

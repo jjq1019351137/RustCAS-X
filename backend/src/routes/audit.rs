@@ -217,6 +217,15 @@ async fn actions_registry(user: CurrentUser) -> AppResult<Json<Value>> {
             {"code": "task.status", "label": "启停任务", "category": "task", "category_label": "任务"},
             {"code": "task.run", "label": "手动执行", "category": "task", "category_label": "任务"},
             {"code": "task.repair_banned", "label": "修复失效分享", "category": "task", "category_label": "任务"},
+            {"code": "drive_account.create", "label": "创建网盘账号", "category": "drive_account", "category_label": "网盘账号"},
+            {"code": "drive_account.update", "label": "更新网盘账号", "category": "drive_account", "category_label": "网盘账号"},
+            {"code": "drive_account.delete", "label": "删除网盘账号", "category": "drive_account", "category_label": "网盘账号"},
+            {"code": "drive_account.probe", "label": "探测网盘账号", "category": "drive_account", "category_label": "网盘账号"},
+            {"code": "drive_account.refresh_profiles", "label": "刷新账号资料", "category": "drive_account", "category_label": "网盘账号"},
+            {"code": "user.create", "label": "创建用户", "category": "user", "category_label": "用户"},
+            {"code": "user.status", "label": "启停用户", "category": "user", "category_label": "用户"},
+            {"code": "user.roles", "label": "设置用户角色", "category": "user", "category_label": "用户"},
+            {"code": "openlist.config.update", "label": "更新 OpenList", "category": "system", "category_label": "系统"},
             {"code": "plugin.refresh", "label": "刷新插件", "category": "plugin", "category_label": "插件"},
             {"code": "plugin.update", "label": "更新插件", "category": "plugin", "category_label": "插件"},
             {"code": "auth.login", "label": "登录", "category": "auth", "category_label": "认证"}
@@ -228,7 +237,8 @@ async fn actions_registry(user: CurrentUser) -> AppResult<Json<Value>> {
             "user": "用户",
             "plugin": "插件",
             "auth": "认证",
-            "system": "系统"
+            "system": "系统",
+            "openlist": "OpenList"
         },
         "sources": {
             "manual": "手动",

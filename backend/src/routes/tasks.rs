@@ -2,6 +2,7 @@ use crate::auth_ctx::{require_perm, CurrentUser};
 use crate::error::{AppError, AppResult};
 use crate::runtime::drama;
 use crate::runtime::scheduler::{self, SchedulerConfig};
+use crate::services::audit;
 use crate::services::magic_rename;
 use crate::services::share_links::{self, load_share_links, mark_checked, save_share_links, set_from_urls};
 use crate::services::share_preview::{
@@ -406,6 +407,15 @@ async fn create_task(
     .fetch_one(&state.db)
     .await?;
 
+    audit::write_user(
+        &state.db,
+        user.id,
+        "task.create",
+        "task",
+        id,
+        Some(&payload.taskname),
+    )
+    .await;
     get_task(State(state), user, Path(id)).await
 }
 
@@ -515,6 +525,7 @@ async fn patch_task(
     .execute(&state.db)
     .await?;
 
+    audit::write_user(&state.db, user.id, "task.update", "task", task_id, None).await;
     get_task(State(state), user, Path(task_id)).await
 }
 
@@ -532,6 +543,7 @@ async fn delete_task(
     if n == 0 {
         return Err(AppError::bad_request("TASK_NOT_FOUND", "任务不存在"));
     }
+    audit::write_user(&state.db, user.id, "task.delete", "task", task_id, None).await;
     Ok(Json(json!({ "ok": true, "id": task_id })))
 }
 
@@ -1012,6 +1024,15 @@ async fn patch_task_status(
     if n == 0 {
         return Err(AppError::bad_request("TASK_NOT_FOUND", "任务不存在"));
     }
+    audit::write_user(
+        &state.db,
+        user.id,
+        "task.status",
+        "task",
+        task_id,
+        Some(&format!("enabled={}", payload.enabled)),
+    )
+    .await;
     get_task(State(state), user, Path(task_id)).await
 }
 
@@ -1069,16 +1090,14 @@ async fn repair_banned_tasks(
         obj.insert("rerun_items".into(), json!(rerun_items));
     }
 
-    let _ = sqlx::query(
-        r#"
-        INSERT INTO audit_logs (actor_user_id, action, target_type, target_id, success, detail, created_at)
-        VALUES (?, 'task.repair_banned', 'task', '*', 1, ?, ?)
-        "#,
+    audit::write_user(
+        &state.db,
+        user.id,
+        "task.repair_banned",
+        "task",
+        "*",
+        Some(&out.to_string()),
     )
-    .bind(user.id)
-    .bind(out.to_string())
-    .bind(chrono::Utc::now().to_rfc3339())
-    .execute(&state.db)
     .await;
 
     Ok(Json(out))
