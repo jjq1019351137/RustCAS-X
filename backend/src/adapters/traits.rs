@@ -77,6 +77,13 @@ pub trait CloudDriveAdapter: Send + Sync {
         Ok(json!({ "status": 200, "data": { "status": 2 } }))
     }
 
+    async fn rename(&self, _fid: &str, _file_name: &str) -> anyhow::Result<Value> {
+        Ok(json!({
+            "code": -1,
+            "message": format!("{} rename pending", self.drive_type())
+        }))
+    }
+
     fn config(&self) -> &HashMap<String, Value>;
 }
 

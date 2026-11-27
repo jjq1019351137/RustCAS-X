@@ -1,5 +1,6 @@
 use crate::auth_ctx::CurrentUser;
 use crate::error::AppResult;
+use crate::runtime::scheduler;
 use crate::state::AppState;
 use axum::extract::{Query, State};
 use axum::routing::get;
@@ -57,11 +58,14 @@ async fn drama_overview(
             .await
             .unwrap_or(0);
 
+    let sched = scheduler::load(&state).await;
     Ok(Json(json!({
         "scheduler": {
-            "enabled": false,
-            "crontab": "0 */2 * * *",
-            "timezone": "Asia/Shanghai"
+            "enabled": sched.enabled,
+            "crontab": format!("every {}m", sched.interval_minutes.max(1)),
+            "interval_minutes": sched.interval_minutes,
+            "timezone": sched.timezone,
+            "hours": sched.hours
         },
         "summary": {
             "task_count": task_count,

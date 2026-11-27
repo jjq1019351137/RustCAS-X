@@ -268,6 +268,7 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
 
     let mut fid_list = Vec::new();
     let mut token_list = Vec::new();
+    let mut rename_plan: Vec<(String, String)> = Vec::new(); // origin -> target
     let mut skipped_pattern = 0usize;
     let mut skipped_start = 0usize;
     let mut skipped_exist = 0usize;
@@ -328,6 +329,9 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
         log.push_str(&format!("save candidate: {name} -> {renamed} ({fid})\n"));
         fid_list.push(fid);
         token_list.push(token);
+        if renamed != name {
+            rename_plan.push((name, renamed));
+        }
     }
 
     log.push_str(&format!(
@@ -375,6 +379,51 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
         if !ok_save {
             return finish(state, exec_id, "failed", msg, &mut log).await;
         }
+    }
+
+    if !rename_plan.is_empty() {
+        // Brief settle so listing sees newly saved files
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let after = adapter.ls_dir(&dest_fid, 500).await.unwrap_or(json!({}));
+        let dest_items = after
+            .pointer("/data/list")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut by_name: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for it in &dest_items {
+            if let (Some(fid), Some(name)) = (item_fid(it), item_name(it)) {
+                by_name.insert(name, fid);
+            }
+        }
+        let mut renamed_ok = 0usize;
+        for (origin, target) in &rename_plan {
+            let Some(fid) = by_name.get(origin) else {
+                log.push_str(&format!("rename skip (fid not found): {origin} → {target}\n"));
+                continue;
+            };
+            match adapter.rename(fid, target).await {
+                Ok(ret) => {
+                    let ok = ret.get("code").and_then(|v| v.as_i64()) == Some(0)
+                        || ret.get("status").and_then(|v| v.as_i64()) == Some(200);
+                    if ok {
+                        renamed_ok += 1;
+                        log.push_str(&format!("renamed {origin} → {target}\n"));
+                    } else {
+                        log.push_str(&format!(
+                            "rename fail {origin} → {target}: {:?}\n",
+                            ret.get("message")
+                        ));
+                    }
+                }
+                Err(e) => log.push_str(&format!("rename err {origin} → {target}: {e}\n")),
+            }
+        }
+        log.push_str(&format!(
+            "rename done ok={renamed_ok}/{}\n",
+            rename_plan.len()
+        ));
     }
 
     log.push_str(&format!("[{}] done\n", Utc::now().to_rfc3339()));

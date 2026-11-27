@@ -1036,6 +1036,42 @@ impl CloudDriveAdapter for Cloud189Adapter {
         Ok(json!({ "status": 200, "code": 0, "data": { "status": 1, "message": "timeout" } }))
     }
 
+    async fn rename(&self, fid: &str, file_name: &str) -> anyhow::Result<Value> {
+        let new_name = file_name.replace('/', "_").trim().to_string();
+        if new_name.is_empty() {
+            return Ok(json!({ "code": 1, "message": "文件名不能为空", "data": {} }));
+        }
+        let resp = self
+            .client
+            .post(format!("{HOST_URL}/api/open/file/renameFile.action"))
+            .headers(self.cookie_header())
+            .header("Referer", "https://cloud.189.cn/")
+            .header("Origin", "https://cloud.189.cn")
+            .form(&[
+                ("fileId", fid),
+                ("destFileName", new_name.as_str()),
+                ("noCache", &format!("{}", chrono::Utc::now().timestamp_millis())),
+            ])
+            .send()
+            .await?;
+        let j: Value = resp.json().await.unwrap_or(json!({}));
+        let ok = j.get("res_code").and_then(|v| v.as_i64()) == Some(0)
+            || j.get("success").and_then(|v| v.as_bool()) == Some(true)
+            || j.get("res_code").map(|v| v.to_string().trim_matches('"').to_string())
+                == Some("0".into());
+        if ok {
+            Ok(json!({ "code": 0, "message": "success", "data": {} }))
+        } else {
+            let msg = j
+                .get("res_message")
+                .or_else(|| j.get("msg"))
+                .or_else(|| j.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("重命名失败");
+            Ok(json!({ "code": 1, "message": msg, "data": {}, "raw": j }))
+        }
+    }
+
     async fn get_stoken(&self, pwd_id: &str, passcode: &str) -> anyhow::Result<Value> {
         if pwd_id.is_empty() {
             return Ok(json!({ "status": 400, "message": "分享链接无效", "data": {} }));

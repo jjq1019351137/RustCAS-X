@@ -557,6 +557,18 @@ impl CloudDriveAdapter for QuarkAdapter {
         }
     }
 
+    async fn rename(&self, fid: &str, file_name: &str) -> anyhow::Result<Value> {
+        let url = format!("{BASE_URL}/1/clouddrive/file/rename");
+        let params = vec![
+            ("pr".into(), "ucpro".into()),
+            ("fr".into(), "pc".into()),
+            ("uc_param_str".into(), "".into()),
+        ];
+        let payload = json!({ "fid": fid, "file_name": file_name });
+        self.send_json(reqwest::Method::POST, url, params, Some(payload))
+            .await
+    }
+
     fn config(&self) -> &HashMap<String, Value> {
         &self.config
     }
