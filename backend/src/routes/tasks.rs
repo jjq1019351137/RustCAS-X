@@ -1,6 +1,8 @@
 use crate::auth_ctx::{require_perm, CurrentUser};
 use crate::error::{AppError, AppResult};
 use crate::runtime::drama;
+use crate::runtime::scheduler::{self, SchedulerConfig};
+use crate::services::magic_rename;
 use crate::services::share_links::{self, load_share_links, mark_checked, save_share_links, set_from_urls};
 use crate::services::share_preview::{
     browse_drive, preview_share, preview_share_batch, DriveBrowseIn, SharePreviewBatchIn,
@@ -78,6 +80,45 @@ struct ShareUrlsCheckIn {
 #[derive(Deserialize)]
 struct ShareUrlActivateIn {
     shareurl: String,
+}
+
+#[derive(Deserialize, Default)]
+struct TaskSchedulerPatch {
+    enabled: Option<bool>,
+    crontab: Option<String>,
+    timezone: Option<String>,
+    openlist_cleanup_enabled: Option<bool>,
+    openlist_cleanup_path: Option<String>,
+    openlist_cleanup_crontab: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct TaskImportIn {
+    #[serde(default)]
+    tasks: Vec<Value>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+fn scheduler_to_frontend(cfg: &SchedulerConfig) -> Value {
+    let mins = cfg.interval_minutes.max(1);
+    json!({
+        "enabled": cfg.enabled,
+        "crontab": format!("*/{mins} * * * *"),
+        "timezone": cfg.timezone,
+        "openlist_cleanup_enabled": false,
+        "openlist_cleanup_path": "",
+        "openlist_cleanup_crontab": "0 4 * * *"
+    })
+}
+
+fn parse_interval_from_crontab(crontab: &str) -> Option<u64> {
+    // Support "*/N * * * *" only for Rust interval scheduler.
+    let first = crontab.split_whitespace().next()?;
+    if let Some(rest) = first.strip_prefix("*/") {
+        return rest.parse().ok();
+    }
+    None
 }
 
 fn drama_type() -> String {
@@ -664,6 +705,318 @@ async fn latest_execution(
     }))
 }
 
+async fn get_magic_regex(user: CurrentUser) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:read")?;
+    Ok(Json(json!({ "rules": magic_rename::list_builtin_rules() })))
+}
+
+async fn get_task_scheduler(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:read")?;
+    let cfg = scheduler::load(&state).await;
+    Ok(Json(scheduler_to_frontend(&cfg)))
+}
+
+async fn patch_task_scheduler(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(payload): Json<TaskSchedulerPatch>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:write")?;
+    let mut cfg = scheduler::load(&state).await;
+    if let Some(v) = payload.enabled {
+        cfg.enabled = v;
+    }
+    if let Some(tz) = payload.timezone.filter(|s| !s.trim().is_empty()) {
+        cfg.timezone = tz;
+    }
+    if let Some(crontab) = payload.crontab {
+        if let Some(mins) = parse_interval_from_crontab(&crontab) {
+            cfg.interval_minutes = mins.max(1);
+        }
+    }
+    let _ = (
+        payload.openlist_cleanup_enabled,
+        payload.openlist_cleanup_path,
+        payload.openlist_cleanup_crontab,
+    );
+    scheduler::save(&state, &cfg)
+        .await
+        .map_err(|e| AppError::bad_request("SCHEDULER_SAVE", e.to_string()))?;
+    Ok(Json(scheduler_to_frontend(&cfg)))
+}
+
+async fn export_tasks(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:read")?;
+    let rows = sqlx::query_as::<_, TaskRow>(&format!(
+        "{TASK_SELECT} ORDER BY sort_index ASC, id ASC"
+    ))
+    .fetch_all(&state.db)
+    .await?;
+    let tasks: Vec<Value> = rows.into_iter().map(map_task_full).collect();
+    Ok(Json(json!({
+        "version": 1,
+        "exported_at": Utc::now().to_rfc3339(),
+        "tasks": tasks
+    })))
+}
+
+async fn import_tasks(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(payload): Json<TaskImportIn>,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:write")?;
+    let mode = payload.mode.unwrap_or_else(|| "skip".into());
+    let mut created = 0usize;
+    let mut updated = 0usize;
+    let mut skipped = 0usize;
+    let mut failed: Vec<Value> = Vec::new();
+    for item in payload.tasks {
+        let taskname = item
+            .get("taskname")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if taskname.is_empty() {
+            failed.push(json!({ "taskname": taskname, "error": "empty taskname" }));
+            continue;
+        }
+        let existing: Option<i64> = sqlx::query_scalar("SELECT id FROM tasks WHERE taskname = ? LIMIT 1")
+            .bind(&taskname)
+            .fetch_optional(&state.db)
+            .await?;
+        if let Some(id) = existing {
+            if mode == "skip" {
+                skipped += 1;
+                continue;
+            }
+            let patch = TaskUpdateIn {
+                taskname: Some(taskname.clone()),
+                shareurl: item.get("shareurl").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                savepath: item.get("savepath").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                account_name: item
+                    .get("account_name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                pattern: item.get("pattern").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                replace_rule: item
+                    .get("replace")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                startfid: item.get("startfid").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                update_subdir: item
+                    .get("update_subdir")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                enddate: item.get("enddate").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                shareurl_ban: item
+                    .get("shareurl_ban")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                tmdb_id: item.get("tmdb_id").and_then(|v| v.as_i64()),
+                tmdb_media_type: item
+                    .get("tmdb_media_type")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                ignore_extension: item.get("ignore_extension").and_then(|v| v.as_bool()),
+                enabled: item.get("enabled").and_then(|v| v.as_bool()),
+                extra: item.get("extra").cloned(),
+                addition: item.get("addition").cloned(),
+                shareurls: item.get("shareurls").and_then(|v| {
+                    v.as_array().map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| {
+                                x.get("url")
+                                    .and_then(|u| u.as_str())
+                                    .or_else(|| x.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .collect()
+                    })
+                }),
+            };
+            match patch_task(
+                State(state.clone()),
+                user.clone(),
+                Path(id),
+                Json(patch),
+            )
+            .await
+            {
+                Ok(_) => updated += 1,
+                Err(e) => failed.push(json!({ "taskname": taskname, "error": format!("{e:?}") })),
+            }
+        } else {
+            let create = TaskCreateIn {
+                taskname: taskname.clone(),
+                task_type: item
+                    .get("task_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("drama")
+                    .to_string(),
+                shareurl: item.get("shareurl").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                savepath: item.get("savepath").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                account_name: item
+                    .get("account_name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                pattern: item.get("pattern").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                replace_rule: item
+                    .get("replace")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                startfid: item.get("startfid").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                update_subdir: item
+                    .get("update_subdir")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                enddate: item.get("enddate").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                shareurl_ban: item
+                    .get("shareurl_ban")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                tmdb_id: item.get("tmdb_id").and_then(|v| v.as_i64()),
+                tmdb_media_type: item
+                    .get("tmdb_media_type")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                ignore_extension: item
+                    .get("ignore_extension")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                enabled: item.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+                extra: item.get("extra").cloned().unwrap_or(json!({})),
+                addition: item.get("addition").cloned().unwrap_or(json!({})),
+                shareurls: item.get("shareurls").and_then(|v| {
+                    v.as_array().map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| {
+                                x.get("url")
+                                    .and_then(|u| u.as_str())
+                                    .or_else(|| x.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .collect()
+                    })
+                }),
+            };
+            match create_task(State(state.clone()), user.clone(), Json(create)).await {
+                Ok(_) => created += 1,
+                Err(e) => failed.push(json!({ "taskname": taskname, "error": format!("{e:?}") })),
+            }
+        }
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "failed": failed,
+        "total": created + updated + skipped + failed.len()
+    })))
+}
+
+async fn run_all_tasks(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:run")?;
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM tasks WHERE enabled = 1 AND task_type = 'drama' ORDER BY sort_index ASC, id ASC LIMIT 100",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let mut results = Vec::new();
+    for id in ids {
+        match drama::run_once(&state, id).await {
+            Ok((exec_id, log)) => results.push(json!({
+                "task_id": id,
+                "execution_id": exec_id,
+                "ok": true,
+                "log_tail": log.chars().rev().take(200).collect::<String>().chars().rev().collect::<String>()
+            })),
+            Err(e) => results.push(json!({
+                "task_id": id,
+                "ok": false,
+                "error": e.to_string()
+            })),
+        }
+    }
+    Ok(Json(json!({ "ok": true, "results": results })))
+}
+
+async fn run_all_tasks_stream(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> AppResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
+    require_perm(&user, "task:run")?;
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM tasks WHERE enabled = 1 AND task_type = 'drama' ORDER BY sort_index ASC, id ASC LIMIT 100",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let mut events = vec![Event::default()
+        .event("log")
+        .data(format!("run-all count={}", ids.len()))];
+    for id in ids {
+        match drama::run_once(&state, id).await {
+            Ok((exec_id, log)) => {
+                events.push(
+                    Event::default()
+                        .event("log")
+                        .data(format!("task={id} exec={exec_id}")),
+                );
+                for line in log.lines().take(40) {
+                    events.push(Event::default().event("log").data(line.to_string()));
+                }
+            }
+            Err(e) => {
+                events.push(
+                    Event::default()
+                        .event("log")
+                        .data(format!("task={id} error={e}")),
+                );
+            }
+        }
+    }
+    events.push(Event::default().event("done").data("ok"));
+    Ok(Sse::new(stream::iter(events.into_iter().map(Ok))).keep_alive(KeepAlive::default()))
+}
+
+async fn repair_banned_stub(user: CurrentUser) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:write")?;
+    Ok(Json(json!({
+        "checked": 0,
+        "repaired": 0,
+        "items": [],
+        "note": "Quark auto-repair not ported yet"
+    })))
+}
+
+async fn stop_completed_stub(user: CurrentUser) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:write")?;
+    Ok(Json(json!({
+        "checked": 0,
+        "matched": 0,
+        "stopped": 0,
+        "task_ids": []
+    })))
+}
+
+async fn suggestions_stub(
+    user: CurrentUser,
+) -> AppResult<Json<Value>> {
+    require_perm(&user, "task:read")?;
+    Ok(Json(json!({ "items": [], "note": "resource search not ported" })))
+}
+
 async fn post_share_preview(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -832,6 +1185,18 @@ async fn activate_task_shareurl(
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_tasks).post(create_task))
+        .route("/magic-regex", get(get_magic_regex))
+        .route(
+            "/scheduler",
+            get(get_task_scheduler).patch(patch_task_scheduler),
+        )
+        .route("/export", get(export_tasks))
+        .route("/import", post(import_tasks))
+        .route("/run-all", post(run_all_tasks))
+        .route("/run-all/stream", post(run_all_tasks_stream))
+        .route("/repair-banned", post(repair_banned_stub))
+        .route("/drama/stop-completed", post(stop_completed_stub))
+        .route("/suggestions", get(suggestions_stub))
         .route("/share/preview", post(post_share_preview))
         .route("/share/preview-batch", post(post_share_preview_batch))
         .route("/drive/browse", post(post_drive_browse))
