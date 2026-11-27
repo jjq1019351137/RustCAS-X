@@ -1,4 +1,5 @@
 use crate::runtime::deferred_delete;
+use crate::services::openlist::{self, join_remote, OpenListClient};
 use crate::state::AppState;
 use chrono::Utc;
 use serde_json::Value;
@@ -73,9 +74,57 @@ pub async fn run_once(state: &AppState, sync_task_id: i64) -> anyhow::Result<(i6
                 }
             }
         }
+        ("local", "openlist") => {
+            let src_rel = source.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let dst_rel = target.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+            match sync_local_to_openlist(state, src_rel, dst_rel, overwrite, &mut log).await {
+                Ok((copied, skipped)) => {
+                    result_status = "success";
+                    result_msg = format!("local→openlist uploaded={copied} skipped={skipped}");
+                    log.push_str(&format!("{result_msg}\n"));
+                }
+                Err(e) => {
+                    result_status = "failed";
+                    result_msg = e.to_string();
+                    log.push_str(&format!("error: {result_msg}\n"));
+                }
+            }
+        }
+        ("openlist", "local") => {
+            let src_rel = source.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+            let dst_rel = target.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            match sync_openlist_to_local(state, src_rel, dst_rel, overwrite, &mut log).await {
+                Ok((copied, skipped)) => {
+                    result_status = "success";
+                    result_msg = format!("openlist→local downloaded={copied} skipped={skipped}");
+                    log.push_str(&format!("{result_msg}\n"));
+                }
+                Err(e) => {
+                    result_status = "failed";
+                    result_msg = e.to_string();
+                    log.push_str(&format!("error: {result_msg}\n"));
+                }
+            }
+        }
+        ("openlist", "openlist") => {
+            let src_rel = source.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+            let dst_rel = target.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+            match sync_openlist_to_openlist(state, src_rel, dst_rel, overwrite, &mut log).await {
+                Ok((copied, skipped)) => {
+                    result_status = "success";
+                    result_msg = format!("openlist→openlist copied={copied} skipped={skipped}");
+                    log.push_str(&format!("{result_msg}\n"));
+                }
+                Err(e) => {
+                    result_status = "failed";
+                    result_msg = e.to_string();
+                    log.push_str(&format!("error: {result_msg}\n"));
+                }
+            }
+        }
         _ => {
             result_status = "success";
-            result_msg = format!("{src_type}→{dst_type} pipeline still migrating (local→local live)");
+            result_msg = format!("{src_type}→{dst_type} not supported yet");
             log.push_str(&format!("{result_msg}\n"));
             if dst_type == "local" {
                 if let Some(base) = target.get("path").and_then(|v| v.as_str()) {
@@ -265,4 +314,219 @@ fn copy_one_file(src: &Path, dst: &Path, overwrite: bool) -> anyhow::Result<Copy
         fs::copy(src, dst)?;
     }
     Ok(CopyOutcome::Copied)
+}
+
+async fn openlist_client(state: &AppState) -> anyhow::Result<OpenListClient> {
+    let cfg = openlist::load_config(state).await?;
+    OpenListClient::new(&cfg)
+}
+
+fn collect_local_files(base: &Path) -> anyhow::Result<Vec<(String, u64, PathBuf)>> {
+    let mut out = Vec::new();
+    if !base.exists() {
+        return Ok(out);
+    }
+    if base.is_file() {
+        let size = fs::metadata(base)?.len();
+        let name = base
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string();
+        out.push((name, size, base.to_path_buf()));
+        return Ok(out);
+    }
+    fn walk(cur: &Path, root: &Path, out: &mut Vec<(String, u64, PathBuf)>) -> anyhow::Result<()> {
+        for entry in fs::read_dir(cur)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') {
+                continue;
+            }
+            let p = entry.path();
+            if p.is_dir() {
+                walk(&p, root, out)?;
+            } else if p.is_file() {
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let size = fs::metadata(&p)?.len();
+                out.push((rel, size, p));
+            }
+        }
+        Ok(())
+    }
+    walk(base, base, &mut out)?;
+    Ok(out)
+}
+
+async fn sync_local_to_openlist(
+    state: &AppState,
+    src_rel: &str,
+    dst_rel: &str,
+    overwrite: bool,
+    log: &mut String,
+) -> anyhow::Result<(usize, usize)> {
+    let client = openlist_client(state).await?;
+    let root = sync_root(state);
+    fs::create_dir_all(&root)?;
+    let src = resolve_under(&root, src_rel)?;
+    log.push_str(&format!(
+        "local→openlist src={} dst={}\n",
+        src.display(),
+        dst_rel
+    ));
+    if !src.exists() {
+        anyhow::bail!("source path not found: {}", src.display());
+    }
+    client.ensure_dir(dst_rel).await?;
+    let files = collect_local_files(&src)?;
+    let remote_files = client.walk_files(dst_rel).await.unwrap_or_default();
+    let remote_map: std::collections::HashMap<String, u64> = remote_files.into_iter().collect();
+
+    let mut copied = 0usize;
+    let mut skipped = 0usize;
+    for (rel, size, local) in files {
+        if let Some(rs) = remote_map.get(&rel) {
+            if *rs == size && !overwrite {
+                skipped += 1;
+                continue;
+            }
+            if !overwrite {
+                skipped += 1;
+                continue;
+            }
+        }
+        let remote = join_remote(dst_rel, &rel);
+        if let Some(parent) = Path::new(&remote).parent() {
+            let parent_s = parent.to_string_lossy().replace('\\', "/");
+            if parent_s != "/" && !parent_s.is_empty() {
+                let _ = client.ensure_dir(&parent_s).await;
+            }
+        }
+        client.put_file(&remote, &local).await?;
+        copied += 1;
+        log.push_str(&format!("uploaded {rel}\n"));
+    }
+    Ok((copied, skipped))
+}
+
+async fn sync_openlist_to_local(
+    state: &AppState,
+    src_rel: &str,
+    dst_rel: &str,
+    overwrite: bool,
+    log: &mut String,
+) -> anyhow::Result<(usize, usize)> {
+    let client = openlist_client(state).await?;
+    let root = sync_root(state);
+    fs::create_dir_all(&root)?;
+    let dst = resolve_under(&root, dst_rel)?;
+    fs::create_dir_all(&dst)?;
+    log.push_str(&format!(
+        "openlist→local src={src_rel} dst={}\n",
+        dst.display()
+    ));
+    let files = client.walk_files(src_rel).await?;
+    let mut copied = 0usize;
+    let mut skipped = 0usize;
+    for (rel, size) in files {
+        let local = {
+            let mut p = dst.to_path_buf();
+            for part in rel.split('/') {
+                if !part.is_empty() {
+                    p.push(part);
+                }
+            }
+            p
+        };
+        if local.exists() && !overwrite {
+            let ls = fs::metadata(&local)?.len();
+            if ls == size {
+                skipped += 1;
+                continue;
+            }
+            skipped += 1;
+            continue;
+        }
+        let remote = join_remote(src_rel, &rel);
+        client.download_to_file(&remote, &local).await?;
+        copied += 1;
+        log.push_str(&format!("downloaded {rel}\n"));
+    }
+    Ok((copied, skipped))
+}
+
+async fn sync_openlist_to_openlist(
+    state: &AppState,
+    src_rel: &str,
+    dst_rel: &str,
+    overwrite: bool,
+    log: &mut String,
+) -> anyhow::Result<(usize, usize)> {
+    let client = openlist_client(state).await?;
+    log.push_str(&format!("openlist→openlist src={src_rel} dst={dst_rel}\n"));
+    client.ensure_dir(dst_rel).await?;
+    let files = client.walk_files(src_rel).await?;
+    let total = files.len();
+    let remote_dst = client.walk_files(dst_rel).await.unwrap_or_default();
+    let dst_map: std::collections::HashMap<String, u64> = remote_dst.into_iter().collect();
+
+    let mut by_dir: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+    let mut skipped = 0usize;
+    for (rel, size) in files {
+        if dst_map.contains_key(&rel) && !overwrite {
+            skipped += 1;
+            continue;
+        }
+        if let Some(rs) = dst_map.get(&rel) {
+            if *rs == size && !overwrite {
+                skipped += 1;
+                continue;
+            }
+        }
+        let name = Path::new(&rel)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&rel)
+            .to_string();
+        let parent = Path::new(&rel)
+            .parent()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .filter(|p| !p.is_empty())
+            .unwrap_or_default();
+        by_dir.entry(parent).or_default().push((rel, name));
+    }
+
+    let mut copied = 0usize;
+    for (parent, items) in &by_dir {
+        let src_dir = if parent.is_empty() {
+            openlist::normalize_abs(src_rel)
+        } else {
+            join_remote(src_rel, parent)
+        };
+        let dst_dir = if parent.is_empty() {
+            openlist::normalize_abs(dst_rel)
+        } else {
+            join_remote(dst_rel, parent)
+        };
+        client.ensure_dir(&dst_dir).await?;
+        let names: Vec<String> = items.iter().map(|(_, n)| n.clone()).collect();
+        match client.fs_copy(&src_dir, &dst_dir, &names, overwrite).await {
+            Ok(_) => {
+                copied += names.len();
+                for (rel, _) in items {
+                    log.push_str(&format!("copied {rel}\n"));
+                }
+            }
+            Err(e) => {
+                log.push_str(&format!("fs_copy fail {src_dir} -> {dst_dir}: {e}\n"));
+            }
+        }
+    }
+    Ok((copied, total.saturating_sub(copied).max(skipped)))
 }

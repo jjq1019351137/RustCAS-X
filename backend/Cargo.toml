@@ -35,6 +35,7 @@ urlencoding = "2"
 futures-util = "0.3"
 tokio-stream = "0.1"
 async-trait = "0.1"
+rsa = { version = "0.9", features = ["pem"] }
 
 [profile.release]
 lto = true

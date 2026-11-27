@@ -6,7 +6,7 @@ use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use futures_util::stream::{self, Stream};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -51,6 +51,22 @@ fn map_task_row(
     created_at: String,
     updated_at: String,
 ) -> Value {
+    let addition: Value = serde_json::from_str(&addition_json).unwrap_or(json!({}));
+    let extra: Value = serde_json::from_str(&extra_json).unwrap_or(json!({}));
+    let episode_weekdays = weekdays_from(&addition, "tmdb_episode_weekdays")
+        .or_else(|| weekdays_from(&extra, "tmdb_episode_weekdays"))
+        .unwrap_or_default();
+    let update_weekdays = weekdays_from(&addition, "tmdb_update_weekdays")
+        .or_else(|| weekdays_from(&extra, "tmdb_update_weekdays"))
+        .unwrap_or_default();
+    let would = compute_would_run_today(
+        enabled != 0,
+        tmdb_id,
+        tmdb_media_type.as_deref(),
+        &extra,
+        &episode_weekdays,
+        &update_weekdays,
+    );
     json!({
         "id": id,
         "task_uid": task_uid,
@@ -61,16 +77,85 @@ fn map_task_row(
         "enabled": enabled != 0,
         "tmdb_id": tmdb_id,
         "tmdb_media_type": tmdb_media_type,
-        "would_run_today": false,
-        "tmdb_episode_weekdays": [],
-        "tmdb_update_weekdays": [],
+        "would_run_today": would,
+        "tmdb_episode_weekdays": episode_weekdays,
+        "tmdb_update_weekdays": update_weekdays,
         "sync_task_uids": [],
         "shareurls": [],
-        "addition": serde_json::from_str::<Value>(&addition_json).unwrap_or(json!({})),
-        "extra": serde_json::from_str::<Value>(&extra_json).unwrap_or(json!({})),
+        "addition": addition,
+        "extra": extra,
         "created_at": created_at,
         "updated_at": updated_at
     })
+}
+
+fn weekdays_from(obj: &Value, key: &str) -> Option<Vec<i64>> {
+    let arr = obj.get(key)?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)))
+            .collect(),
+    )
+}
+
+fn normalize_weekdays(v: &Value) -> Vec<i64> {
+    match v {
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|x| x.as_i64().or_else(|| x.as_u64().map(|u| u as i64)))
+            .filter(|d| (1..=7).contains(d))
+            .collect(),
+        Value::String(s) => s
+            .split([',', ' ', '|'])
+            .filter_map(|p| p.trim().parse::<i64>().ok())
+            .filter(|d| (1..=7).contains(d))
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// Align with Python: iso weekday Mon=1 … Sun=7.
+fn compute_would_run_today(
+    enabled: bool,
+    tmdb_id: Option<i64>,
+    media_type: Option<&str>,
+    extra: &Value,
+    episode_weekdays: &[i64],
+    update_weekdays: &[i64],
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    if extra.get("ended").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return false;
+    }
+    let today = chrono::Local::now().date_naive().weekday().number_from_monday() as i64;
+    let mode = extra
+        .get("runweek_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("manual")
+        .to_lowercase();
+    if mode == "auto" {
+        let tid = tmdb_id.unwrap_or(0);
+        let mt = media_type.unwrap_or("").to_lowercase();
+        if tid <= 0 || mt != "tv" {
+            return false;
+        }
+        let week: std::collections::HashSet<i64> = if !episode_weekdays.is_empty() {
+            episode_weekdays.iter().copied().collect()
+        } else {
+            update_weekdays.iter().copied().collect()
+        };
+        if week.is_empty() {
+            return false;
+        }
+        return week.contains(&today);
+    }
+    let runweek = normalize_weekdays(extra.get("runweek").unwrap_or(&Value::Null));
+    if runweek.is_empty() {
+        return true;
+    }
+    runweek.contains(&today)
 }
 
 async fn list_tasks(State(state): State<AppState>, user: CurrentUser) -> AppResult<Json<Value>> {

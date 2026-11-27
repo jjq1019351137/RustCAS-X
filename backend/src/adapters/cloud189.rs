@@ -3,14 +3,26 @@ use super::traits::{
     ExtractedShare,
 };
 use async_trait::async_trait;
+use base64::Engine;
 use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue, COOKIE};
+use rsa::pkcs8::DecodePublicKey;
+use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use url::Url;
 
 const HOST_URL: &str = "https://cloud.189.cn";
+const AUTH_URL: &str = "https://open.e.189.cn/api/logbox/oauth2/";
+const FALLBACK_RSA_PEM: &str = "-----BEGIN PUBLIC KEY-----
+MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDY7mpaUysvgQkbp0iIn2ezoUyh
+i1zPFn0HCXloLFWT7uoNkqtrphpQ/63LEcPz1VYzmDuDIf3iGxQKzeoHTiVMSmW6
+FlhDeqVOG094hFJvZeK4OzA6HVwzwnEW5vIZ7d+u61RV1bsFxmB68+8JXs3ycGcE
+4anY+YzZJcyOcEGKVQIDAQAB
+-----END PUBLIC KEY-----";
+const B64MAP: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const BI_RM: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
 pub fn meta() -> DriveTypeMeta {
     DriveTypeMeta {
@@ -221,6 +233,360 @@ impl Cloud189Adapter {
             .map(|s| s.to_string());
         Ok(share_id.filter(|s| !s.is_empty()))
     }
+
+    fn rsa_encode(pub_key_b64_or_pem: &str, text: &str) -> anyhow::Result<String> {
+        let pem = if pub_key_b64_or_pem.contains("BEGIN PUBLIC KEY") {
+            pub_key_b64_or_pem.to_string()
+        } else if pub_key_b64_or_pem.trim().is_empty() {
+            FALLBACK_RSA_PEM.to_string()
+        } else {
+            format!(
+                "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
+                pub_key_b64_or_pem.trim()
+            )
+        };
+        let key = RsaPublicKey::from_public_key_pem(&pem)
+            .map_err(|e| anyhow::anyhow!("rsa public key: {e}"))?;
+        let mut rng = rand::thread_rng();
+        let enc = key
+            .encrypt(&mut rng, Pkcs1v15Encrypt, text.as_bytes())
+            .map_err(|e| anyhow::anyhow!("rsa encrypt: {e}"))?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(enc);
+        Ok(b64_to_hex(&b64))
+    }
+
+    fn encrypt_for_login(login_params: &Value, text: &str) -> anyhow::Result<String> {
+        let key = login_params
+            .get("pubKey")
+            .or_else(|| login_params.get("j_rsakey"))
+            .or_else(|| login_params.get("j_rsaKey"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let pre = login_params
+            .get("pre")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let enc = if key.is_empty() {
+            Self::rsa_encode("", text)?
+        } else {
+            Self::rsa_encode(key, text)?
+        };
+        if !pre.is_empty() {
+            Ok(format!("{pre}{enc}"))
+        } else {
+            Ok(format!("{{RSA}}{enc}"))
+        }
+    }
+
+    async fn get_login_url_params(&self) -> anyhow::Result<Value> {
+        let resp = self
+            .client
+            .get(format!("{HOST_URL}/api/portal/loginUrl.action"))
+            .query(&[
+                ("pageId", "1"),
+                ("redirectURL", &format!("{HOST_URL}/main.action")),
+            ])
+            .send()
+            .await?;
+        let final_url = resp.url().clone();
+        let qs: HashMap<String, String> = final_url
+            .query_pairs()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let lt = qs.get("lt").cloned().unwrap_or_default();
+        let req_id = qs.get("reqId").cloned().unwrap_or_default();
+        let app_id = qs.get("appId").cloned().unwrap_or_default();
+        if lt.is_empty() || req_id.is_empty() || app_id.is_empty() {
+            anyhow::bail!("登录页已过期，请稍后重试");
+        }
+
+        let conf = self
+            .client
+            .post("https://open.e.189.cn/api/logbox/oauth2/appConf.do")
+            .header("lt", &lt)
+            .header("reqId", &req_id)
+            .header("reqid", &req_id)
+            .header("origin", "https://open.e.189.cn")
+            .header("referer", final_url.as_str())
+            .form(&[("version", "2.0"), ("appKey", app_id.as_str())])
+            .send()
+            .await?
+            .json::<Value>()
+            .await
+            .unwrap_or(json!({}));
+        if conf.get("result").map(|v| v.to_string()) != Some("0".into())
+            && conf.get("result").and_then(|v| v.as_i64()) != Some(0)
+        {
+            anyhow::bail!(
+                "{}",
+                conf.get("msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("页面已过期，刷新后重试")
+            );
+        }
+        let data = conf.get("data").cloned().unwrap_or(json!({}));
+
+        let enc = self
+            .client
+            .post("https://open.e.189.cn/api/logbox/config/encryptConf.do")
+            .header("lt", &lt)
+            .header("reqId", &req_id)
+            .form(&[("appId", app_id.as_str())])
+            .send()
+            .await?
+            .json::<Value>()
+            .await
+            .unwrap_or(json!({}));
+        let enc_data = enc.get("data").cloned().unwrap_or(json!({}));
+        if enc.get("result").and_then(|v| v.as_i64()).unwrap_or(1) != 0
+            && enc.get("result").map(|v| v.to_string()) != Some("0".into())
+        {
+            anyhow::bail!("encryptConf invalid");
+        }
+
+        let mut out = data.as_object().cloned().unwrap_or_default();
+        out.insert("lt".into(), json!(lt));
+        out.insert("reqId".into(), json!(req_id));
+        out.insert("appKey".into(), json!(app_id));
+        out.insert(
+            "pre".into(),
+            json!(enc_data.get("pre").and_then(|v| v.as_str()).unwrap_or("")),
+        );
+        out.insert(
+            "pubKey".into(),
+            json!(enc_data.get("pubKey").and_then(|v| v.as_str()).unwrap_or("")),
+        );
+        out.insert("dynamicCheck".into(), json!("FALSE"));
+        Ok(Value::Object(out))
+    }
+
+    async fn need_captcha(&self, login_params: &Value, username: &str) -> anyhow::Result<bool> {
+        let enc_user = Self::encrypt_for_login(login_params, username)?;
+        let lt = login_params
+            .get("lt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let req_id = login_params
+            .get("reqId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let app_key = login_params
+            .get("appKey")
+            .and_then(|v| v.as_str())
+            .unwrap_or("cloud");
+        let resp = self
+            .client
+            .post(format!("{AUTH_URL}needcaptcha.do"))
+            .header("lt", lt)
+            .header("reqId", req_id)
+            .header("REQID", req_id)
+            .form(&[
+                ("accountType", "01"),
+                ("userName", enc_user.as_str()),
+                ("appKey", app_key),
+            ])
+            .send()
+            .await?;
+        let text = resp.text().await.unwrap_or_default();
+        let trimmed = text.trim().trim_matches('"');
+        Ok(trimmed == "1")
+    }
+
+    async fn login_submit(
+        &self,
+        username: &str,
+        password: &str,
+        captcha_code: &str,
+        login_params: &Value,
+    ) -> anyhow::Result<Value> {
+        let lt = login_params
+            .get("lt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let req_id = login_params
+            .get("reqId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let return_url = login_params
+            .get("returnUrl")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let param_id = login_params
+            .get("paramId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if return_url.is_empty() || param_id.is_empty() {
+            anyhow::bail!("登录参数过期");
+        }
+        let enc_user = Self::encrypt_for_login(login_params, username)?;
+        let enc_pwd = Self::encrypt_for_login(login_params, password)?;
+        let captcha_type = if captcha_code.is_empty() { "0" } else { "1" };
+        let app_key = login_params
+            .get("appKey")
+            .and_then(|v| v.as_str())
+            .unwrap_or("cloud");
+        let mail_suffix = login_params
+            .get("mailSuffix")
+            .and_then(|v| v.as_str())
+            .unwrap_or("@189.cn");
+        let client_type = login_params
+            .get("clientType")
+            .map(|v| v.to_string().trim_matches('"').to_string())
+            .unwrap_or_else(|| "1".into());
+        let cb_save = login_params
+            .get("cb_SaveName")
+            .map(|v| v.to_string().trim_matches('"').to_string())
+            .unwrap_or_else(|| "3".into());
+        let state = login_params
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let resp = self
+            .client
+            .post(format!("{AUTH_URL}loginSubmit.do"))
+            .header("lt", lt)
+            .header("reqId", req_id)
+            .header("REQID", req_id)
+            .header(
+                "Referer",
+                "https://open.e.189.cn/api/logbox/oauth2/unifyAccountLogin.do",
+            )
+            .header("Cookie", format!("LT={lt}"))
+            .header("X-Requested-With", "XMLHttpRequest")
+            .form(&[
+                ("version", "v2.0"),
+                ("appKey", app_key),
+                ("accountType", "01"),
+                ("userName", enc_user.as_str()),
+                ("epd", enc_pwd.as_str()),
+                ("captchaType", captcha_type),
+                ("validateCode", captcha_code),
+                ("smsValidateCode", captcha_code),
+                ("captchaToken", ""),
+                ("returnUrl", return_url),
+                ("mailSuffix", mail_suffix),
+                ("dynamicCheck", "FALSE"),
+                ("clientType", client_type.as_str()),
+                ("cb_SaveName", cb_save.as_str()),
+                ("isOauth2", "true"),
+                ("state", state),
+                ("paramId", param_id),
+            ])
+            .send()
+            .await?;
+        Ok(resp.json().await.unwrap_or(json!({})))
+    }
+
+    async fn login_by_password(&mut self) -> anyhow::Result<Value> {
+        let username = self.cfg_str("username");
+        let password = self.cfg_str("password");
+        if username.is_empty() || password.is_empty() {
+            anyhow::bail!("缺少 username/password");
+        }
+        let login_params = self.get_login_url_params().await?;
+        if self.need_captcha(&login_params, &username).await? {
+            return Ok(json!({
+                "ok": false,
+                "need_captcha": true,
+                "message": "需要图形验证码；请先在原站完成验证后填入 cookie/sson，或后续接入验证码通道"
+            }));
+        }
+        let j = self
+            .login_submit(&username, &password, "", &login_params)
+            .await?;
+        let result = j
+            .get("result")
+            .and_then(|v| v.as_i64())
+            .or_else(|| {
+                j.get("result")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap_or(1);
+        if result == 0 {
+            if let Some(to_url) = j.get("toUrl").and_then(|v| v.as_str()) {
+                let _ = self.client.get(to_url).send().await;
+            }
+            // Persist session cookies back into config when possible
+            if let Some(info) = self.get_logined_infos().await? {
+                self.active = true;
+                let nickname = info
+                    .get("nickname")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("天翼用户")
+                    .to_string();
+                self.nickname = nickname.clone();
+                return Ok(json!({
+                    "ok": true,
+                    "drive_type": "cloud189",
+                    "drive_name": "天翼云盘",
+                    "nickname": nickname,
+                    "username": nickname,
+                    "login": "password",
+                    "raw": { "account_info": info }
+                }));
+            }
+            return Ok(json!({
+                "ok": false,
+                "message": "密码登录跳转完成但会话未生效，请检查 cookie 同步"
+            }));
+        }
+        if result == -133 || result == -134 {
+            return Ok(json!({
+                "ok": false,
+                "need_second_valid": true,
+                "result": result,
+                "message": j.get("msg").and_then(|v| v.as_str()).unwrap_or("需要二次设备校验")
+            }));
+        }
+        Ok(json!({
+            "ok": false,
+            "message": j.get("msg").and_then(|v| v.as_str()).unwrap_or("登录失败")
+        }))
+    }
+}
+
+fn b64_to_hex(a: &str) -> String {
+    let mut d = String::new();
+    let mut e = 0i32;
+    let mut c = 0i32;
+    for ch in a.chars() {
+        if ch == '=' {
+            continue;
+        }
+        let v = B64MAP
+            .iter()
+            .position(|&b| b == ch as u8)
+            .unwrap_or(0) as i32;
+        match e {
+            0 => {
+                e = 1;
+                d.push(BI_RM[(v >> 2) as usize] as char);
+                c = 3 & v;
+            }
+            1 => {
+                e = 2;
+                d.push(BI_RM[((c << 2) | (v >> 4)) as usize] as char);
+                c = 15 & v;
+            }
+            2 => {
+                e = 3;
+                d.push(BI_RM[c as usize] as char);
+                d.push(BI_RM[(v >> 2) as usize] as char);
+                c = 3 & v;
+            }
+            _ => {
+                e = 0;
+                d.push(BI_RM[((c << 2) | (v >> 4)) as usize] as char);
+                d.push(BI_RM[(15 & v) as usize] as char);
+            }
+        }
+    }
+    if e == 1 {
+        d.push(BI_RM[(c << 2) as usize] as char);
+    }
+    d
 }
 
 fn access_res() -> &'static [Regex] {
@@ -357,9 +723,14 @@ impl CloudDriveAdapter for Cloud189Adapter {
                 "raw": { "account_info": info }
             }));
         }
+        let user = self.cfg_str("username");
+        let pass = self.cfg_str("password");
+        if !user.is_empty() && !pass.is_empty() {
+            return self.login_by_password().await;
+        }
         Ok(json!({
             "ok": false,
-            "message": "cookie/sson 无效；用户名密码登录与验证码流程仍在迁移"
+            "message": "cookie/sson 无效，且未配置 username/password"
         }))
     }
 

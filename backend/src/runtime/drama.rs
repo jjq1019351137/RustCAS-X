@@ -84,12 +84,20 @@ pub async fn run_once(state: &AppState, task_id: i64) -> anyhow::Result<(i64, St
             if let Some(d) = details.as_ref() {
                 series_title = tmdb::media_title(d);
                 let weekdays = tmdb::infer_weekdays_from_details(d);
+                // TMDB weekdays are Mon=0..Sun=6; store as ISO Mon=1..Sun=7 for would_run_today
+                let iso_days: Vec<i64> = weekdays
+                    .iter()
+                    .map(|d| if *d == 6 { 7 } else { (*d + 1) as i64 })
+                    .collect();
                 log.push_str(&format!(
-                    "tmdb id={id} title={:?} year={:?} weekdays={:?}\n",
+                    "tmdb id={id} title={:?} year={:?} weekdays_iso={:?}\n",
                     series_title,
                     tmdb::media_year(d),
-                    weekdays
+                    iso_days
                 ));
+                if !iso_days.is_empty() {
+                    let _ = persist_tmdb_weekdays(state, task_id, &iso_days).await;
+                }
             } else {
                 log.push_str(&format!("tmdb fetch miss id={id}\n"));
             }
@@ -421,6 +429,29 @@ fn value_as_fid(v: &Value) -> String {
         Value::Number(n) => n.to_string(),
         _ => "0".into(),
     }
+}
+
+async fn persist_tmdb_weekdays(state: &AppState, task_id: i64, days: &[i64]) -> anyhow::Result<()> {
+    let raw: Option<String> =
+        sqlx::query_scalar("SELECT addition_json FROM tasks WHERE id = ?")
+            .bind(task_id)
+            .fetch_optional(&state.db)
+            .await?;
+    let mut addition: Value = raw
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = addition.as_object_mut() {
+        obj.insert("tmdb_episode_weekdays".into(), json!(days));
+        obj.insert("tmdb_update_weekdays".into(), json!(days));
+    }
+    sqlx::query("UPDATE tasks SET addition_json = ?, updated_at = ? WHERE id = ?")
+        .bind(addition.to_string())
+        .bind(Utc::now().to_rfc3339())
+        .bind(task_id)
+        .execute(&state.db)
+        .await?;
+    Ok(())
 }
 
 async fn finish(
